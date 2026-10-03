@@ -1120,6 +1120,14 @@ def main() -> None:
         print("The tray app is already running; not starting a second copy.", file=sys.stderr)
         return
     setup_logging()
+    if sys.platform == "darwin":
+        import AppKit
+
+        # pystray creates an NSApplication for the status item. Keep it out of the Dock.
+        if not AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        ):
+            log.warning("could not hide Python Dock icon")
     App(args.ip, args.interval, args.animation, args.provider, args.night, args.night_brightness).run()
 
 
