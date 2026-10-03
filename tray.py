@@ -5,7 +5,7 @@ Windows/Linux: left-click the tray icon to toggle, right-click for the menu.
 macOS: clicking the menu-bar icon opens the menu; pick Claude or Codex there.
 
     python tray.py                                      # finds the screen on your network by itself
-    python tray.py --ip 192.168.1.77                    # or tell it where the screen is
+    python tray.py --ip 192.168.1.20                    # or tell it where the screen is
     python tray.py --install-startup                    # run it at every login
     python tray.py --uninstall-startup
 
@@ -31,6 +31,7 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
+import agent_activity
 import alerts
 import autostart
 import discover
@@ -42,7 +43,7 @@ import usage_stats
 # Identifies the code that draws the screens. The device keeps the images it was sent, so after an update (new
 # labels, colours, animations...) what's stored is out of date; a changed id makes the app re-upload every view once.
 RENDER_ID = hashlib.sha1(b"".join(
-    Path(module.__file__).read_bytes() for module in (g, pace, alerts, usage_stats)
+    Path(module.__file__).read_bytes() for module in (g, pace, alerts, usage_stats, agent_activity)
 )).hexdigest()[:12]
 
 LOG_PATH = Path(__file__).with_name("tray.log")
@@ -67,9 +68,14 @@ REDISCOVER_EVERY = 120  # ...and then at most this often
 DISCOVER_RETRY = 30  # while there's no address at all, how often to scan
 LOCK_POLL = 3  # seconds between checks of whether the computer got locked / unlocked
 PAUSE_POLL = 5  # while paused, how often the worker looks again
-LOCAL_STATS_EVERY = 600  # Codex's local activity counts are refreshed at most this often (seconds)
+LOCAL_STATS_EVERY = 600  # the providers' local activity counts are refreshed at most this often (seconds)
+LOCAL_STATS_RETRY = 60  # ...or this often while one of them is still missing (it failed)
+BACKGROUND_STATS = True  # count in a thread (the first count of a month of logs takes seconds); tests turn it off
+AGENT_POLL = 5  # seconds between looks at whether an agent is working
+AGENT_IDLE_POLLS = 2  # polls in a row that must say "idle" before a run counts as finished (no flapping)
+AGENT_MIN_RUN = 60  # a run shorter than this (seconds) ends without a notification
 HISTORY_MAX = 150  # readings kept per usage window, for the recent-pace estimate
-HISTORY_EVERY = 300  # ...adding one at least this often (seconds), or whenever the percentage changed
+HISTORY_EVERY = {"current": 300, "weekly": 1800}  # ...adding one at least this often (seconds), or when the % changed
 DEFAULT_BRIGHTNESS_CHOICES = (100, 75, 50, 25, 10, 0)  # the menu's brightness levels (the device takes -10..100)
 LOCK_DIM_LEVEL = 0  # backlight level while the computer is locked, if "dim when locked" is on
 NIGHT_DEFAULT = {"enabled": False, "start": 22, "end": 7, "level": 10}  # 10 PM - 7 AM at 10 %
@@ -82,7 +88,13 @@ def slot_file(provider: str, slot: str) -> str:
 TITLES = {"claude": "Claude", "codex": "Codex"}
 SPLIT = "split"  # key of the third view (both providers on one screen); it has its own image slots on the device
 STATS = "stats"  # the fourth: activity numbers for both providers
-PANEL_PUSH = {SPLIT: "push_split", STATS: "push_stats"}  # views of both providers -> the geekmagic_claude function that uploads them
+BREAKDOWN = "breakdown"  # which projects and models the requests went to
+HOURS = "hours"  # at what hours of the day you work
+# views of both providers -> the geekmagic_claude function that uploads them
+PANEL_PUSH = {SPLIT: "push_split", STATS: "push_stats", BREAKDOWN: "push_breakdown", HOURS: "push_hours"}
+STATS_VIEWS = {STATS, BREAKDOWN, HOURS}  # the ones drawn from the providers' local activity logs
+VIEW_NAMES = {SPLIT: "vista dividida", STATS: "estadísticas", BREAKDOWN: "proyectos y modelos", HOURS: "horas pico"}
+PROVIDER_OF = {"Claude": "claude", "Codex": "codex"}  # a reading's title -> its provider key
 WINDOWS = (("current", "sesión"), ("weekly", "semana"))  # usage window keys -> how notifications name them
 
 
@@ -123,8 +135,29 @@ def make_stats_icon() -> Image.Image:
     return canvas
 
 
+def make_breakdown_icon() -> Image.Image:
+    """Three horizontal bars of different lengths: shares of a total."""
+    canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    for i, (length, color) in enumerate(((46, g.THEMES["Claude"]["body"]), (32, g.THEMES["Codex"]["body"]), (18, g.THEMES["Codex"]["weekly"]))):
+        y = 12 + i * 15
+        draw.rectangle((8, y, 8 + length, y + 9), fill=color)
+    return canvas
+
+
+def make_hours_icon() -> Image.Image:
+    """A little histogram with its busy stretch in the middle: the hours of the day."""
+    canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    for i, height in enumerate((8, 12, 22, 38, 44, 30, 16, 10)):
+        x = 6 + i * 7
+        draw.rectangle((x, 54 - height, x + 5, 54), fill=g.THEMES["Claude"]["body"] if 3 <= i <= 4 else g._blend(g.THEMES["Claude"]["body"], g.BG, 0.45))
+    return canvas
+
+
 def _icon_for(key: str) -> Image.Image:
-    return {SPLIT: make_split_icon, STATS: make_stats_icon}.get(key, lambda: make_icon(key))()
+    return {SPLIT: make_split_icon, STATS: make_stats_icon, BREAKDOWN: make_breakdown_icon,
+            HOURS: make_hours_icon}.get(key, lambda: make_icon(key))()
 
 
 def _hour12(hour: int) -> str:
@@ -149,6 +182,13 @@ class App:
         self.night: dict = dict(NIGHT_DEFAULT)  # the device's own night schedule, see set_night_mode
         self.paused = False  # manual pause (not remembered: a forgotten pause would be a nasty surprise)
         self.locked = False
+        self.notify_done = True  # tell me when an agent that has been working a while finishes
+        self.agent: dict[str, dict] = {}  # provider -> latest agent_activity state (is it working right now?)
+        self.agent_project: dict[str, str | None] = {}  # ...and what it's working on, kept for the "finished" note
+        self.run_started: dict[str, float] = {}  # provider -> when its current run began
+        self.idle_polls: dict[str, int] = {}  # polls in a row that said idle, for a run that was working
+        self.agent_dirty = False  # an agent started or stopped: redraw from what's already read
+        self._counting = False  # the local activity counts are being computed in a thread
         self.outdated: set[str] = set()  # views whose stored image was drawn by an older version of the code
         self.slot: dict[str, str] = self._load_state()  # provider -> "a"/"b", the complete image on the device
         if night_hours:  # --night START-END / --night-brightness: the schedule the menu's night mode will use
@@ -185,6 +225,10 @@ class App:
                 pystray.MenuItem("Codex", lambda: self.select("codex"), checked=lambda _: self.mode is None and self.provider == "codex", radio=True),
                 pystray.MenuItem("Vista dividida", self.toggle_split, checked=lambda _: self.split),
                 pystray.MenuItem("Estadísticas", self.toggle_stats, checked=lambda _: self.mode == STATS),
+                pystray.MenuItem("Más vistas", pystray.Menu(
+                    pystray.MenuItem("Proyectos y modelos", self.toggle_breakdown, checked=lambda _: self.mode == BREAKDOWN),
+                    pystray.MenuItem("Horas pico", self.toggle_hours, checked=lambda _: self.mode == HOURS),
+                )),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Actualizar ahora", lambda: self.wake.set()),
                 pystray.MenuItem("Pausar", self.toggle_pause, checked=lambda _: self.paused),
@@ -198,6 +242,7 @@ class App:
                 )),
                 pystray.MenuItem("Opciones", pystray.Menu(
                     pystray.MenuItem("Notificaciones", self.toggle_notifications, checked=lambda _: self.notify_enabled),
+                    pystray.MenuItem("Avisar cuando un agente termine", self.toggle_notify_done, checked=lambda _: self.notify_done),
                     pystray.MenuItem("Pausar al bloquear el PC", self.toggle_pause_on_lock, checked=lambda _: self.pause_on_lock),
                 )),
                 pystray.MenuItem("Ver logs", self.open_logs),
@@ -219,12 +264,10 @@ class App:
         return self.mode or self.provider
 
     def _tooltip(self) -> str:
-        if self.mode == SPLIT:
-            view = "vista dividida"
-        elif self.mode == STATS:
-            view = "estadísticas"
-        else:
-            view = f"mostrando {TITLES[self.provider]}"
+        view = VIEW_NAMES[self.mode] if self.mode else f"mostrando {TITLES[self.provider]}"
+        busy = [TITLES[p] for p in TITLES if self.agent.get(p, {}).get("working")]
+        if busy:
+            view += " · " + " y ".join(busy) + " trabajando"
         if self.paused:
             return f"GeekMagic: {view} (en pausa)"
         if self.pause_on_lock and self.locked:
@@ -247,6 +290,7 @@ class App:
             self.notify_enabled = bool(saved.get("notify", True))
             self.saved_view = saved.get("view") if saved.get("view") in (*TITLES, *PANEL_PUSH) else None
             self.saved_provider = saved.get("provider") if saved.get("provider") in TITLES else None
+            self.notify_done = bool(saved.get("notify_done", True))
             self.pause_on_lock = bool(saved.get("pause_on_lock", True))
             self.dim_on_lock = bool(saved.get("dim_on_lock", False))
             level = saved.get("brightness")
@@ -269,7 +313,7 @@ class App:
             "slots": self.slot, "animations": g._recent_animations, "ip": self.ip or None,
             "alerts": self.alerts, "notify": self.notify_enabled,
             "view": self._active_key(), "provider": self.provider,
-            "pause_on_lock": self.pause_on_lock, "dim_on_lock": self.dim_on_lock,
+            "pause_on_lock": self.pause_on_lock, "dim_on_lock": self.dim_on_lock, "notify_done": self.notify_done,
             "brightness": self.brightness, "night": self.night, "history": self.history,
             "render": RENDER_ID if not self.outdated else None,  # only claimed once every stored image is current
         }
@@ -361,6 +405,71 @@ class App:
 
     def toggle_stats(self) -> None:
         self._toggle_mode(STATS)
+
+    def toggle_breakdown(self) -> None:
+        self._toggle_mode(BREAKDOWN)
+
+    def toggle_hours(self) -> None:
+        self._toggle_mode(HOURS)
+
+    def toggle_notify_done(self) -> None:
+        self.notify_done = not self.notify_done
+        log.info("agent-finished notifications %s", "on" if self.notify_done else "off")
+        self._save_state()
+        self.icon.update_menu()
+
+    # --- agents: is Claude / Codex working right now? ----------------------------------------------------------
+
+    def _watch_agents(self) -> None:
+        """Thread: look at the agents' logs every few seconds, even while paused or locked (that's when you want
+        to hear that one finished)."""
+        while not self.stop.is_set():
+            self._poll_agents()
+            self.stop.wait(AGENT_POLL)
+
+    def _poll_agents(self) -> None:
+        for provider, state_of in agent_activity.STATES.items():
+            try:
+                state = state_of(time.time())
+            except Exception:
+                log.warning("could not read %s's activity", provider, exc_info=True)
+                continue
+            self._agent_update(provider, state)
+
+    def _agent_update(self, provider: str, state: dict) -> None:
+        """Follow one agent. A run starting shows at once; one ending is only believed after AGENT_IDLE_POLLS quiet
+        polls in a row, so the gaps between its steps don't make the screen flicker or notify too early."""
+        was = bool(self.agent.get(provider, {}).get("working"))
+        if state["working"]:
+            self.idle_polls[provider] = 0
+            self.agent_project[provider] = state.get("project")
+            self.agent[provider] = state
+            if not was:
+                self.run_started[provider] = state.get("since") or time.time()
+                log.info("%s started working (%s)", provider, state.get("project"))
+                self._agent_changed()
+            return
+        if not was:
+            self.agent[provider] = state
+            return
+        self.idle_polls[provider] = self.idle_polls.get(provider, 0) + 1
+        if self.idle_polls[provider] < AGENT_IDLE_POLLS:
+            return
+        self.agent[provider] = state
+        started = self.run_started.pop(provider, None)
+        lasted = time.time() - started if started else 0
+        log.info("%s finished (worked %s)", provider, agent_activity.duration_text(lasted))
+        if self.notify_done and lasted >= AGENT_MIN_RUN:
+            project = self.agent_project.get(provider)
+            self._notify(TITLES[provider], f"Terminó (trabajó {agent_activity.duration_text(lasted)}"
+                                           + (f" en {project})" if project else ")"))
+        self._agent_changed()
+
+    def _agent_changed(self) -> None:
+        """Redraw with (or without) the working indicator, from the readings we already have."""
+        self.agent_dirty = True
+        self.icon.title = self._tooltip()
+        self.wake.set()
 
     def toggle_notifications(self) -> None:
         self.notify_enabled = not self.notify_enabled
@@ -518,6 +627,7 @@ class App:
             # while the click's own request waits. Stand down; the worker retries once clicking settles.
             self.wake.set()
             return False
+        usage = self._flag_working(key, usage)
         self.cancel = cancel = threading.Event()
         with self.push_lock:
             spare = "b" if self.slot.get(key) == "a" else "a"
@@ -540,6 +650,19 @@ class App:
             if key == self._active_key():  # checked after the slow upload, in case the user switched meanwhile
                 g.show_image(self.ip, filename)
             return True
+
+    def _working(self, provider: str | None) -> bool:
+        return bool(provider and self.agent.get(provider, {}).get("working"))
+
+    def _flag_working(self, key: str, usage: dict) -> dict:
+        """What's about to be drawn, with each provider's "its agent is working right now" flag set from the latest
+        look at its logs (the screen draws a green dot and the mascot works)."""
+        if key in TITLES:
+            return {**usage, "working": self._working(key)}
+        if key in PANEL_PUSH:
+            return {**usage, "panels": [{**p, "working": self._working(PROVIDER_OF.get(p.get("title")))}
+                                        for p in usage["panels"]]}
+        return usage
 
     def _sync_with_device(self) -> None:
         """Forget remembered images the device no longer has, and drop leftovers of the old single-file scheme."""
@@ -652,7 +775,7 @@ class App:
                 continue
             points = self.history.setdefault(f"{provider}/{window}", [])
             points[:] = [p for p in points if abs(p[2] - reset.timestamp()) < 120]
-            if not points or points[-1][1] != pct or now - points[-1][0] >= HISTORY_EVERY:
+            if not points or points[-1][1] != pct or now - points[-1][0] >= HISTORY_EVERY[window]:
                 points.append([now, pct, reset.timestamp()])
             del points[:-HISTORY_MAX]
 
@@ -733,28 +856,46 @@ class App:
                 continue
             usage, read_at = good
             usage = dict(usage, stale=True) if time.monotonic() - read_at >= STALE_SECONDS else dict(usage)
-            if key == STATS:
+            if key in STATS_VIEWS:
                 usage["activity"] = self.local_stats.get(provider)
             panels.append(usage)
         return panels
 
     def _refresh_local_stats(self) -> None:
-        """Both providers' activity comes from their local logs (~100 MB each): count now and then, not every cycle."""
-        if time.monotonic() - self.local_stats_at < LOCAL_STATS_EVERY and len(self.local_stats) == len(TITLES):
+        """Both providers' activity comes from their local logs (up to a month of them): count now and then, not every
+        cycle, and in a thread, since the first count takes seconds. Until it's done the screens say "Counting...";
+        when it is, the loop is woken to redraw."""
+        since = time.monotonic() - self.local_stats_at
+        complete = len(self.local_stats) == len(TITLES)
+        if self._counting or since < (LOCAL_STATS_EVERY if complete else LOCAL_STATS_RETRY):
             return
         self.local_stats_at = time.monotonic()
-        for provider, count in usage_stats.STATS.items():
-            try:
-                stats = count(time.time())
-                self.local_stats[provider] = stats if stats is not None else {}
-            except Exception:
-                log.warning("could not count %s's local activity", provider, exc_info=True)
+        if BACKGROUND_STATS:
+            self._counting = True
+            threading.Thread(target=self._count_local_stats, daemon=True).start()
+        else:
+            self._count_local_stats()
 
-    def _update_panels(self, key: str) -> str:
-        """Split / stats view: read both providers (so both get alerts) and upload one screen with the two of them."""
-        for provider in TITLES:
-            self._fetch_usage(provider)
-        if key == STATS:
+    def _count_local_stats(self) -> None:
+        try:
+            for provider, count in usage_stats.STATS.items():
+                try:
+                    stats = count(time.time())
+                    self.local_stats[provider] = stats if stats is not None else {}
+                except Exception:
+                    log.warning("could not count %s's local activity", provider, exc_info=True)
+        finally:
+            self._counting = False
+            if BACKGROUND_STATS:
+                self.wake.set()  # redraw the screen that was saying "Counting..."
+
+    def _update_panels(self, key: str, refetch: bool = True) -> str:
+        """A view of both providers: read both (so both get alerts) and upload one screen with the two of them.
+        `refetch=False` redraws from the readings we already have (only an agent started or stopped)."""
+        if refetch:
+            for provider in TITLES:
+                self._fetch_usage(provider)
+        if key in STATS_VIEWS:
             self._refresh_local_stats()
         panels = self._panels(key)
         if not panels:
@@ -772,7 +913,7 @@ class App:
             return
         for key in sorted(self.outdated - {self._active_key()}):
             if key in PANEL_PUSH:
-                if key == STATS:
+                if key in STATS_VIEWS:
                     self._refresh_local_stats()
                 usage = {"panels": self._panels(key)}
                 ready = bool(usage["panels"])
@@ -805,8 +946,11 @@ class App:
                 continue
             provider = self.provider
             wait = self.interval
+            # An agent started or stopped (and nothing else changed): redraw from the readings we already have.
+            redraw_only, self.agent_dirty = self.agent_dirty, False
             if self.mode:
-                if self._update_panels(self.mode) == "offline":
+                recent = all(self._recently_read(p) for p in TITLES)
+                if self._update_panels(self.mode, refetch=not (redraw_only and recent)) == "offline":
                     wait = RETRY_SECONDS
                     self._maybe_rediscover()
                 self._refresh_outdated_views()
@@ -814,6 +958,8 @@ class App:
                 continue
             if pending and pending[0] == provider and time.monotonic() - pending[2] < self.interval:
                 usage = pending[1]  # read moments ago but not delivered yet: don't query again
+            elif redraw_only and self._recently_read(provider):
+                usage = self.last_good[provider][0]
             else:
                 usage = self._fetch_usage(provider)
             pending = None
@@ -829,9 +975,14 @@ class App:
             self._refresh_outdated_views()
             self.wake.wait(wait)
 
+    def _recently_read(self, provider: str) -> bool:
+        good = self.last_good.get(provider)
+        return good is not None and time.monotonic() - good[1] < self.interval
+
     def run(self) -> None:
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self._watch_lock, daemon=True).start()
+        threading.Thread(target=self._watch_agents, daemon=True).start()
         self.icon.run()
 
 

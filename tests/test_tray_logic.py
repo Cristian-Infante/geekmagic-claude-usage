@@ -33,6 +33,7 @@ class TrayLogicTests(unittest.TestCase):
             patch.object(tray, "STATE_PATH", self.tmp / "state.json"),
             patch.object(g, "list_images", return_value=set()),
             patch.object(g, "delete_image"),
+            patch.object(tray, "BACKGROUND_STATS", False),  # count the activity inline so tests are deterministic
         ]
         for p in patches:
             p.start()
@@ -143,12 +144,12 @@ class TrayLogicTests(unittest.TestCase):
     def test_rediscovers_a_device_that_moved_to_another_ip(self):
         app = self.make("192.168.1.50")
         app.offline, app.offline_since = True, time.monotonic() - tray.REDISCOVER_AFTER - 1
-        with patch.object(discover, "find_device", return_value="192.168.1.77") as find:
+        with patch.object(discover, "find_device", return_value="192.168.1.20") as find:
             app._maybe_rediscover()
             find.assert_called_once_with(prefer="192.168.1.50")
-        self.assertEqual(app.ip, "192.168.1.77")
+        self.assertEqual(app.ip, "192.168.1.20")
         self.assertEqual(self.notes[-1][0], "Pantalla encontrada")
-        self.assertEqual(self.make(None).ip, "192.168.1.77")  # remembered for the next start
+        self.assertEqual(self.make(None).ip, "192.168.1.20")  # remembered for the next start
 
     def test_doesnt_scan_right_away_or_too_often(self):
         app = self.make("192.168.1.50")
@@ -175,9 +176,9 @@ class TrayLogicTests(unittest.TestCase):
             app._maybe_rediscover()
         self.assertEqual(app.ip, "")
         app.last_scan = time.monotonic() - tray.DISCOVER_RETRY - 1
-        with patch.object(discover, "find_device", return_value="192.168.1.77"):
+        with patch.object(discover, "find_device", return_value="192.168.1.20"):
             app._maybe_rediscover()
-        self.assertEqual(app.ip, "192.168.1.77")
+        self.assertEqual(app.ip, "192.168.1.20")
 
     def test_startup_prefers_given_ip_then_remembered_then_scans(self):
         (self.tmp / "state.json").write_text('{"ip": "192.168.1.99"}')
@@ -190,10 +191,10 @@ class TrayLogicTests(unittest.TestCase):
             app._resolve_device()
             self.assertEqual(app.ip, "192.168.1.99")
         with patch.object(discover, "probe", return_value=False), \
-                patch.object(discover, "find_device", return_value="192.168.1.77"):
+                patch.object(discover, "find_device", return_value="192.168.1.20"):
             app = self.make("192.168.1.50")
             app._resolve_device()
-            self.assertEqual(app.ip, "192.168.1.77")
+            self.assertEqual(app.ip, "192.168.1.20")
 
     # --- split view -----------------------------------------------------------------------------------
 
@@ -741,7 +742,7 @@ class TrayLogicTests(unittest.TestCase):
     def test_the_menu_has_every_new_button_in_a_sensible_order(self):
         app = self.make()
         top = [item.text for item in app.icon.menu.items if not item.text.startswith("-")]  # (no separators)
-        for wanted in ("Vista dividida", "Estadísticas", "Actualizar ahora", "Pausar", "Pantalla", "Opciones", "Ver logs", "Salir"):
+        for wanted in ("Vista dividida", "Estadísticas", "Más vistas", "Actualizar ahora", "Pausar", "Pantalla", "Opciones", "Ver logs", "Salir"):
             self.assertIn(wanted, top)
         self.assertLess(top.index("Vista dividida"), top.index("Estadísticas"))
         self.assertLess(top.index("Estadísticas"), top.index("Actualizar ahora"))
@@ -752,7 +753,8 @@ class TrayLogicTests(unittest.TestCase):
                          [f"Brillo {level} %" for level in tray.DEFAULT_BRIGHTNESS_CHOICES])
         self.assertIn("Atenuar al bloquear el PC", sub["Pantalla"])
         self.assertTrue(any(x.startswith("Modo nocturno") for x in sub["Pantalla"]))
-        self.assertEqual(sub["Opciones"], ["Notificaciones", "Pausar al bloquear el PC"])
+        self.assertEqual(sub["Opciones"], ["Notificaciones", "Avisar cuando un agente termine", "Pausar al bloquear el PC"])
+        self.assertEqual(sub["Más vistas"], ["Proyectos y modelos", "Horas pico"])
 
     def test_night_hours_argument(self):
         import argparse
@@ -778,6 +780,220 @@ class TrayLogicTests(unittest.TestCase):
             item(app.icon)
         send.assert_called_once_with("192.168.1.50", 25)
         self.assertTrue(item.checked)
+
+    # --- projects / models and hours views ---------------------------------------------------------------------
+
+    def test_the_two_new_views_are_menu_modes_like_the_others(self):
+        app = self.make()
+        with patch.object(g, "show_image"):
+            for toggle, mode, words in ((app.toggle_breakdown, "breakdown", "proyectos y modelos"), (app.toggle_hours, "hours", "horas pico")):
+                toggle()
+                self.assertEqual((app.mode, app._active_key()), (mode, mode))
+                self.assertIn(words, app._tooltip())
+                self.assertEqual(self.make()._active_key(), mode, "remembered across restarts")
+                app.toggle()  # the click leaves it
+                self.assertEqual((app.mode, app._active_key()), (None, "claude"))
+            app.toggle_hours()
+            app.toggle_breakdown()  # one view of both at a time
+            self.assertEqual(app.mode, "breakdown")
+            app.toggle_breakdown()
+            self.assertIsNone(app.mode)
+
+    def test_each_new_view_has_its_own_icon_and_its_own_slots_on_the_device(self):
+        for key in (tray.STATS, tray.BREAKDOWN, tray.HOURS, tray.SPLIT):
+            self.assertEqual(tray._icon_for(key).size, (64, 64))
+        self.assertEqual(len({tray._icon_for(k).tobytes() for k in (tray.STATS, tray.BREAKDOWN, tray.HOURS, tray.SPLIT)}), 4)
+        app = self.make()
+        app.slot.update(breakdown="a", hours="b")
+        app._save_state()
+        self.assertEqual({k: v for k, v in self.make().slot.items() if k in ("breakdown", "hours")}, {"breakdown": "a", "hours": "b"})
+
+    def test_each_view_uploads_through_its_own_function(self):
+        app = self.make()
+        uploaded = []
+        patches = [patch.object(g, name, side_effect=lambda ip, panels, filename, name=name, **k: uploaded.append((name, filename)))
+                   for name in ("push_stats", "push_breakdown", "push_hours")]
+        with patches[0], patches[1], patches[2], patch.object(g, "show_image"):
+            for key in (tray.STATS, tray.BREAKDOWN, tray.HOURS):
+                app._upload(key, {"panels": [usage()]})
+        self.assertEqual(uploaded, [("push_stats", "stats-usage-a.gif"), ("push_breakdown", "breakdown-usage-a.gif"),
+                                    ("push_hours", "hours-usage-a.gif")])
+
+    def test_the_activity_views_carry_each_providers_activity_and_count_it_once(self):
+        app = self.make()
+        calls = []
+        activity = {p: {"24h": {"requests": 1, "sessions": 1}, "7d": {"requests": 1, "sessions": 1}, "days": [], "total": 1,
+                        "projects": [], "models": [], "hours": [0] * 24} for p in tray.TITLES}
+        counters = {p: (lambda now, p=p: calls.append(p) or activity[p]) for p in tray.TITLES}
+        seen = {}
+        with patch.dict(tray.usage_stats.STATS, counters), \
+                patch.dict(g.PROVIDERS, {"claude": lambda: usage(20, 5), "codex": lambda: usage(10, 5, title="Codex")}), \
+                patch.object(g, "show_image"), \
+                patch.object(g, "push_breakdown", side_effect=lambda ip, panels, name, **k: seen.setdefault("breakdown", panels)), \
+                patch.object(g, "push_hours", side_effect=lambda ip, panels, name, **k: seen.setdefault("hours", panels)):
+            for mode in (tray.BREAKDOWN, tray.HOURS):
+                app.mode = mode
+                self.assertEqual(app._update_panels(mode), "ok")
+        for panels in seen.values():
+            self.assertEqual([p["activity"] for p in panels], [activity["claude"], activity["codex"]])
+        self.assertEqual(sorted(calls), ["claude", "codex"], "both views share one count")
+
+    def test_the_count_runs_in_a_thread_and_wakes_the_loop_when_done(self):
+        app = self.make()
+        gate = threading.Event()
+
+        def slow(now):
+            gate.wait(2)
+            return {"24h": {"requests": 1, "sessions": 1}}
+
+        with patch.object(tray, "BACKGROUND_STATS", True), \
+                patch.dict(tray.usage_stats.STATS, {"claude": slow, "codex": slow}):
+            app.wake.clear()
+            app._refresh_local_stats()
+            self.assertTrue(app._counting, "counting in the background")
+            self.assertEqual(app.local_stats, {}, "the screens say 'Counting...' meanwhile")
+            app._refresh_local_stats()  # a second request while one is running does nothing
+            gate.set()
+            for _ in range(100):
+                if not app._counting:
+                    break
+                time.sleep(0.02)
+        self.assertFalse(app._counting)
+        self.assertEqual(sorted(app.local_stats), ["claude", "codex"])
+        self.assertTrue(app.wake.is_set(), "the loop is woken to redraw")
+
+    def test_a_failed_count_is_retried_sooner_than_a_good_one_is_refreshed(self):
+        app = self.make()
+        calls = []
+
+        def broken(now):
+            calls.append(1)
+            raise OSError("disk")
+
+        with patch.dict(tray.usage_stats.STATS, {"claude": lambda now: {"24h": {}}, "codex": broken}):
+            app._refresh_local_stats()
+            app._refresh_local_stats()
+            self.assertEqual(len(calls), 1, "not again straight away")
+            app.local_stats_at -= tray.LOCAL_STATS_RETRY + 1
+            app._refresh_local_stats()
+            self.assertEqual(len(calls), 2, "incomplete: retried after a minute, not after ten")
+
+    # --- agents working: indicator and "finished" notifications -------------------------------------------------
+
+    def state(self, working, since=None, project="Acme App"):
+        return {"working": working, "since": since, "last": time.time(), "project": project}
+
+    def test_a_run_starting_is_shown_at_once_and_flags_the_redraw(self):
+        app = self.make()
+        app.wake.clear()
+        app._agent_update("claude", self.state(True, since=time.time() - 30))
+        self.assertTrue(app._working("claude"))
+        self.assertFalse(app._working("codex"))
+        self.assertTrue(app.agent_dirty)
+        self.assertTrue(app.wake.is_set())
+        self.assertIn("Claude trabajando", app._tooltip())
+        self.assertEqual(self.notes, [], "starting isn't worth a notification")
+
+    def test_a_run_is_only_over_after_two_quiet_polls_in_a_row(self):
+        app = self.make()
+        app._agent_update("claude", self.state(True, since=time.time() - 300))
+        app.agent_dirty = False
+        app._agent_update("claude", self.state(False))
+        self.assertTrue(app._working("claude"), "one quiet poll: probably just a gap between steps")
+        self.assertFalse(app.agent_dirty)
+        app._agent_update("claude", self.state(True, since=time.time() - 300))  # it picked up again
+        app._agent_update("claude", self.state(False))
+        self.assertTrue(app._working("claude"), "the quiet streak starts over")
+        app._agent_update("claude", self.state(False))
+        self.assertFalse(app._working("claude"))
+        self.assertTrue(app.agent_dirty)
+
+    def test_a_long_run_finishing_notifies_with_how_long_and_where(self):
+        app = self.make()
+        app._agent_update("codex", self.state(True, since=time.time() - 250, project="Storefront"))
+        app._agent_update("codex", self.state(False, project="Storefront"))
+        app._agent_update("codex", self.state(False, project="Storefront"))
+        title, message = self.notes[-1]
+        self.assertEqual(title, "Codex")
+        self.assertIn("Terminó", message)
+        self.assertIn("4 min", message)
+        self.assertIn("Storefront", message)
+
+    def test_short_runs_finish_without_a_notification(self):
+        app = self.make()
+        app._agent_update("claude", self.state(True, since=time.time() - 20))
+        for _ in range(2):
+            app._agent_update("claude", self.state(False))
+        self.assertEqual(self.notes, [])
+        self.assertFalse(app._working("claude"))
+
+    def test_the_finished_notification_can_be_turned_off_and_is_remembered(self):
+        app = self.make()
+        app.toggle_notify_done()
+        self.assertFalse(app.notify_done)
+        app._agent_update("claude", self.state(True, since=time.time() - 400))
+        for _ in range(2):
+            app._agent_update("claude", self.state(False))
+        self.assertEqual(self.notes, [])
+        self.assertTrue(app.agent_dirty, "the screen still updates")
+        self.assertFalse(self.make().notify_done)
+
+    def test_a_run_already_under_way_when_the_app_starts_is_timed_from_the_log(self):
+        app = self.make()
+        app._agent_update("claude", self.state(True, since=time.time() - 900))  # started 15 minutes before we looked
+        for _ in range(2):
+            app._agent_update("claude", self.state(False))
+        self.assertIn("15 min", self.notes[-1][1])
+
+    def test_polling_reads_both_agents_and_survives_a_failure(self):
+        app = self.make()
+        states = {"claude": lambda now: self.state(True, since=now - 100), "codex": lambda now: 1 / 0}
+        with patch.dict(tray.agent_activity.STATES, states):
+            app._poll_agents()
+        self.assertTrue(app._working("claude"))
+        self.assertFalse(app._working("codex"))
+
+    def test_the_flag_reaches_what_gets_drawn(self):
+        app = self.make()
+        app.agent = {"claude": {"working": True}}
+        single = app._flag_working("claude", usage())
+        self.assertTrue(single["working"])
+        self.assertFalse(app._flag_working("codex", usage(title="Codex"))["working"])
+        panels = app._flag_working("split", {"panels": [usage(), usage(title="Codex")]})["panels"]
+        self.assertEqual([p["working"] for p in panels], [True, False])
+        self.assertNotIn("working", usage(), "the original reading isn't modified")
+
+    def test_uploads_carry_the_flag(self):
+        app = self.make()
+        app.agent = {"codex": {"working": True}}
+        seen = []
+        with patch.object(g, "push_usage", side_effect=lambda ip, u, anim, name, **k: seen.append(u["working"])), \
+                patch.object(g, "show_image"):
+            app._upload("codex", usage(title="Codex"))
+            app._upload("claude", usage())
+        self.assertEqual(seen, [True, False])
+
+    def test_an_agent_change_redraws_from_what_is_already_read_without_querying_again(self):
+        app = self.make()
+        queries = []
+        with patch.dict(g.PROVIDERS, {"claude": lambda: queries.append("claude") or usage(),
+                                      "codex": lambda: queries.append("codex") or usage(title="Codex")}), \
+                patch.object(g, "push_usage"), patch.object(g, "push_split"), patch.object(g, "show_image"):
+            app._fetch_usage("claude")
+            app._fetch_usage("codex")
+            queries.clear()
+            self.assertEqual(app._update_panels("split", refetch=False), "ok")
+            self.assertEqual(queries, [], "redrawn from the last readings")
+            app._update_panels("split")
+            self.assertEqual(sorted(queries), ["claude", "codex"])
+
+    def test_the_agent_watcher_keeps_working_while_paused(self):
+        app = self.make()
+        app.paused = True
+        app._agent_update("claude", self.state(True, since=time.time() - 300))
+        for _ in range(2):
+            app._agent_update("claude", self.state(False))
+        self.assertEqual(len(self.notes), 1, "paused or locked is exactly when you want to hear it")
 
     # --- images drawn by older code ------------------------------------------------------------------------
 

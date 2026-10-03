@@ -94,9 +94,10 @@ The menu, top to bottom (its labels are in Spanish; the English is in brackets):
 
 - **Claude**, **Codex**: one provider's screen.
 - **Vista dividida** (Split view) and **Estadísticas** (Stats): both providers at once.
+- **Más vistas** (More views) ▸ **Proyectos y modelos** (Projects and models) and **Horas pico** (Peak hours).
 - **Actualizar ahora** (Update now) and **Pausar** (Pause).
 - **Pantalla** (Screen) ▸ brightness levels, **Modo nocturno** (Night mode), **Atenuar al bloquear el PC** (Dim when the PC locks).
-- **Opciones** (Options) ▸ **Notificaciones** (Notifications), **Pausar al bloquear el PC** (Pause when the PC locks).
+- **Opciones** (Options) ▸ **Notificaciones** (Notifications), **Avisar cuando un agente termine** (Notify when an agent finishes), **Pausar al bloquear el PC** (Pause when the PC locks).
 - **Ver logs** (View logs) and **Salir** (Quit).
 
 - **Near-instant switching.** Each provider's last image already lives on the
@@ -152,6 +153,60 @@ second or two). For Claude they agree with what `claude /usage` calls "Last
 24h / Last 7d". Only this machine's activity is counted. It's a still image, so
 it uploads quickly. Logic: `usage_stats.py`.
 
+### Projects and models, and peak hours
+
+Two more screens, under **Más vistas**, from the same local logs and again
+**identical for both providers**:
+
+<table>
+<tr>
+  <td align="center"><img src="docs/preview-breakdown.png" width="240" alt="Projects and models: for Claude and for Codex, the share of the week's requests that went to each of the top three projects and models"><br><b>Projects and models</b></td>
+  <td align="center"><img src="docs/preview-hours.png" width="240" alt="Peak hours: for each provider, requests per hour of the day over four weeks, with the busiest two-hour stretch highlighted"><br><b>Peak hours</b></td>
+</tr>
+</table>
+
+- **Proyectos y modelos:** where this week's requests went. The top three
+  projects (by folder name; a folder like `frontend` or `src` is shown with its
+  parent, `Storefront/frontend`) and the top three models, as shares of that
+  provider's own total. Handy for seeing what's eating your limit: Opus vs
+  Sonnet, or one project that dwarfs the rest.
+- **Horas pico:** requests per hour of the day over the **last four weeks**, with
+  the busiest two-hour stretch highlighted and named ("Busiest 12-2 PM"). Use it
+  to plan heavy work for just after a session resets. Hours are local time.
+
+Projects and models come from the folder a session ran in and the model it
+called, as each log records them. Counting a month of logs takes a few seconds
+the first time, so it runs in the background and the screen says "Counting..."
+until it's done.
+
+### Agent activity
+
+The screens tell you when Claude Code or Codex is **working right now**, and the
+tray tells you when one that had been busy a while **finishes**, so you can walk
+away from a long run:
+
+<table>
+<tr>
+  <td align="center"><img src="docs/preview-working-claude.gif" width="200" alt="Claude's screen with a green Working badge and its mascot typing on a laptop"></td>
+  <td align="center"><img src="docs/preview-working-codex.gif" width="200" alt="Codex's screen with a green Working badge, its cloud typing brackets, and the free-resets note beneath"></td>
+</tr>
+</table>
+
+- **While it works:** a green dot ("Working" on the single screens, a dot by the
+  clock on the others) and the mascot switches to a working animation (Claude at
+  its laptop, Codex typing brackets) instead of the random one. The tray's
+  tooltip says it too.
+- **When it finishes:** a notification like "Terminó (trabajó 4 min en Acme App)",
+  but only for runs of a minute or more, and only once it has stayed quiet for a
+  few seconds, so the gaps between its steps don't count. It also works while
+  the PC is locked or paused, which is exactly when you'd want to hear it. Turn it
+  off under **Opciones**.
+- **How it knows:** both tools keep writing a local log. Claude Code's ends in a
+  finished reply (`end_turn`) when it is done and in a tool call or a tool result
+  while it works; Codex marks each turn `task_started` / `task_complete`. A log
+  that goes quiet is treated as abandoned after a while (2 minutes, or 10 while a
+  tool runs). Logic: `agent_activity.py`.
+
 ### Codex's free resets
 
 Codex grants free rate-limit resets that expire. Its screen shows how many you
@@ -169,8 +224,9 @@ countdown: **"~89% at reset"** when you'll make it, or **"Full in 30m"**
 <img src="docs/preview-pace.png" width="480" alt="Pace under the bars: ~89% at reset, Full in 30m, Full in 7h 35m, and none while it's too early in the window">
 
 It uses the faster of your average since the window started and your pace over
-the last 30 minutes (6 hours for the week), so a burst of work shows up instead
-of being averaged away. Nothing is shown when it's too early in a window (under
+the last 30 minutes (the last day for the week, and only once there's at least
+a quarter of that much history, so a short burst isn't stretched over days),
+so a burst of work shows up instead of being averaged away. Nothing is shown when it's too early in a window (under
 8 % of it) or almost nothing has been used, and never on stale numbers. Window
 lengths are 5 hours and 7 days; Codex reports its own. Logic: `pace.py`.
 
@@ -388,6 +444,7 @@ python -m unittest tests.test_alerts    # one file
 |---|---|
 | `test_alerts.py` | colour thresholds and when notifications fire |
 | `test_pace.py` | pace projection: where a window ends up, when it runs out |
+| `test_agent_activity.py` | deciding from the logs whether Claude / Codex is working right now |
 | `test_usage_stats.py` | the same activity stats for both providers (counts, sessions, daily chart, cache), Codex's free resets |
 | `test_session_lock.py` | screen-lock detection (real here, mocked for macOS / Linux) |
 | `test_brightness.py` | brightness and night mode, against a fake device |

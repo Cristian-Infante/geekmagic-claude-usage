@@ -762,10 +762,15 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
         extra(image, mascot_w)
 
     draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=title_font, fill=TEXT)
+    working = bool(usage.get("working"))  # its agent is running right now: a green "Working" top right
+    if working:
+        label_w = draw.textlength("Working", font=footer_font)
+        draw.text((230 - label_w, 7), "Working", font=footer_font, fill=WORKING_COLOR)
+        _draw_working_dot(draw, 230 - label_w - 11, 15)
     chip = _resets_chip(usage)  # Codex only: the free rate-limit resets you still have, top right
     if chip:
         text, color = chip
-        draw.text((230 - draw.textlength(text, font=footer_font), 15), text, font=footer_font, fill=color)
+        draw.text((230 - draw.textlength(text, font=footer_font), 23 if working else 15), text, font=footer_font, fill=color)
 
     _draw_section(
         draw, top=40, label="Session", percent=usage["current_pct"],
@@ -873,6 +878,8 @@ def _draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, f
     if not usage.get("stale"):
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 12), updated, font=fonts["small"], fill=theme["current"])
+        if usage.get("working"):
+            _draw_working_dot(draw, 230 - width - 11, top + 19)
     for row_top, label, window, accent in (
         (top + 40, "Session", "current", theme["current"]),
         (top + 77, "Weekly", "weekly", theme["weekly"]),
@@ -917,7 +924,10 @@ def render_split(panels: list[dict], animations: list[str] | None = None) -> byt
 def _animation_for(usage: dict, requested: str) -> str:
     """The animation a provider's panel should play: the one asked for if it's one of that provider's, else a
     random one from its own set (never one of its last three)."""
-    group = ANIMATION_GROUPS.get(usage.get("title", "Claude"), ANIMATION_GROUPS["Claude"])
+    title = usage.get("title", "Claude")
+    group = ANIMATION_GROUPS.get(title, ANIMATION_GROUPS["Claude"])
+    if usage.get("working") and requested in ("auto", "random"):
+        return WORKING_ANIMATION.get(title, "idle")  # its agent is busy: the mascot works too
     return requested if requested in group else _pick_animation(usage)
 
 
@@ -931,6 +941,8 @@ def push_split(
     upload(ip, render_split(panels, names), filename, "image/gif", show, cancel)
     if animation in ("auto", "random"):
         for usage, name in zip(panels[:2], names):
+            if usage.get("working"):
+                continue  # busy agent: its mascot works, which isn't a rotation pick
             history = _recent_animations.setdefault(usage.get("title", "Claude"), [])
             history.append(name)
             del history[:-RECENT_ANIMATIONS]
@@ -979,17 +991,47 @@ def _blend(color: str, over: str, amount: float) -> tuple[int, int, int]:
     return tuple(round(b[k] + (a[k] - b[k]) * amount) for k in range(3))
 
 
+WORKING_COLOR = "#4ADE80"  # the dot (and word) that says an agent is running right now
+WORKING_ANIMATION = {"Claude": "typing", "Codex": "code"}  # what each mascot does while its agent works
+
+
+def _draw_working_dot(draw, x: float, y: float) -> None:
+    """A small green dot with a halo: "this agent is working", in the corner of a panel header."""
+    draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=_blend(WORKING_COLOR, BG, 0.3))
+    draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=WORKING_COLOR)
+
+
+def _draw_panel_header(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    """The header every two-provider view shares: small mascot, name, time (or the working dot beside it)."""
+    theme = _theme(usage)
+    draw = ImageDraw.Draw(image)
+    _draw_mascot(image, (10, top + 8), 2, theme)
+    draw.text((46, top + 5), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
+    if not usage.get("stale"):
+        updated = _clock(usage["now"])
+        width = draw.textlength(updated, font=fonts["small"])
+        draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
+        if usage.get("working"):
+            _draw_working_dot(draw, 230 - width - 11, top + 17)
+
+
+def _dim_stale_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    """A panel whose numbers couldn't be refreshed: everything dimmed, and since when."""
+    if not usage.get("stale"):
+        return
+    box = (0, top, WIDTH, top + SPLIT_PANEL_H)
+    image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
+    text = f"! stale since {_clock(usage['now'])}"
+    draw = ImageDraw.Draw(image)
+    draw.text((230 - draw.textlength(text, font=fonts["small"]), top + 10), text, font=fonts["small"], fill=STATE_COLORS["warn"])
+
+
 def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
     """One provider's activity: requests and sessions for 24 h and 7 days, and requests per day over the last week.
     The very same layout and numbers for every provider, so they can be compared at a glance."""
     theme = _theme(usage)
     draw = ImageDraw.Draw(image)
-    _draw_mascot(image, (10, top + 8), 2, theme)
-    draw.text((46, top + 5), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
-    updated = _clock(usage["now"])
-    if not usage.get("stale"):
-        width = draw.textlength(updated, font=fonts["small"])
-        draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
+    _draw_panel_header(image, top, usage, fonts)
     activity = usage.get("activity")
     if not activity:
         draw.text((10, top + 40), "No local activity logs found" if activity == {} else "Counting...",
@@ -999,22 +1041,87 @@ def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) ->
             draw.text((10, top + 28 + i * 15), usage_stats.counts_text(label, activity[label]), font=fonts["body"], fill=TEXT)
         _draw_week_chart(draw, activity["days"], left=10, right=230, baseline=top + 106, height=34,
                          color=theme["body"], fonts=fonts)
-    if usage.get("stale"):
-        box = (0, top, WIDTH, top + SPLIT_PANEL_H)
-        image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
-        text = f"! stale since {updated}"
-        width = ImageDraw.Draw(image).textlength(text, font=fonts["small"])
-        ImageDraw.Draw(image).text((230 - width, top + 10), text, font=fonts["small"], fill=STATE_COLORS["warn"])
+    _dim_stale_panel(image, top, usage, fonts)
 
 
-def _render_stats_frame(panels: list[dict]) -> Image.Image:
+def _draw_share_rows(draw, items: list[dict], total: int, *, left: int, width: int, top: int, color: str, fonts: dict) -> None:
+    """Up to three rows: a name, its share in %, and a bar under them."""
+    for i, (name, share) in enumerate(usage_stats.shares(items, total, 3)):
+        y = top + i * 25
+        pct = f"{share * 100:.0f}%" if share >= 0.01 else "<1%"
+        pct_w = draw.textlength(pct, font=fonts["tiny"])
+        draw.text((left, y), _fit(draw, name, fonts["tiny"], width - pct_w - 6), font=fonts["tiny"], fill=TEXT)
+        draw.text((left + width - pct_w, y), pct, font=fonts["tiny"], fill=MUTED)
+        draw.rounded_rectangle((left, y + 14, left + width, y + 19), radius=2, fill=PILL_BG)
+        draw.rounded_rectangle((left, y + 14, left + max(3, round(width * share)), y + 19), radius=2, fill=color)
+
+
+def _draw_breakdown_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    """Where this week's requests went: the top projects on the left, the top models on the right (shares of the
+    provider's own total, same layout for every provider)."""
+    theme = _theme(usage)
+    draw = ImageDraw.Draw(image)
+    _draw_panel_header(image, top, usage, fonts)
+    activity = usage.get("activity")
+    if not activity or not activity.get("total"):
+        draw.text((10, top + 40), "No local activity logs found" if activity == {} else
+                  "Counting..." if activity is None else "No activity in the last 7 days", font=fonts["body"], fill=MUTED)
+    else:
+        for left, label, key, color in ((10, "Projects · 7d", "projects", theme["body"]), (126, "Models · 7d", "models", theme["weekly"])):
+            draw.text((left, top + 28), label, font=fonts["tiny"], fill=MUTED)
+            _draw_share_rows(draw, activity[key], activity["total"], left=left, width=104, top=top + 42, color=color, fonts=fonts)
+    _dim_stale_panel(image, top, usage, fonts)
+
+
+def _draw_hours_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    """When you work: requests for each hour of the day over the last four weeks, with the busiest stretch called out."""
+    theme = _theme(usage)
+    draw = ImageDraw.Draw(image)
+    _draw_panel_header(image, top, usage, fonts)
+    activity = usage.get("activity")
+    hours = (activity or {}).get("hours")
+    if not hours or not any(hours):
+        draw.text((10, top + 40), "No local activity logs found" if activity == {} else
+                  "Counting..." if activity is None else "No activity in the last 4 weeks", font=fonts["body"], fill=MUTED)
+    else:
+        window = usage_stats.busiest_hours(hours)
+        draw.text((10, top + 27), f"Busiest {usage_stats.hours_text(window)} · last {usage_stats.HOURS_DAYS} days",
+                  font=fonts["body"], fill=TEXT)
+        peak, baseline, height = max(hours), top + 102, 46
+        dim = _blend(theme["body"], BG, 0.45)
+        for hour, n in enumerate(hours):
+            x = 12 + hour * 9
+            h = max(2, round(height * n / peak)) if n else 2
+            inside = window[0] <= hour < window[0] + 2 or (window[1] < window[0] and hour < window[1])  # (wraps midnight)
+            draw.rectangle((x, baseline - h, x + 6, baseline - 1), fill=theme["body"] if inside and n else (dim if n else PILL_BG))
+        for hour, label in ((0, "12a"), (6, "6a"), (12, "12p"), (18, "6p")):
+            draw.text((12 + hour * 9, baseline + 1), label, font=fonts["tiny"], fill=MUTED)
+    _dim_stale_panel(image, top, usage, fonts)
+
+
+PANEL_DRAWERS = {"stats": _draw_stats_panel, "breakdown": _draw_breakdown_panel, "hours": _draw_hours_panel}
+
+
+def _render_panel_view(panels: list[dict], drawer) -> Image.Image:
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
     fonts = {"title": ImageFont.load_default(size=17), "body": ImageFont.load_default(size=12),
              "small": ImageFont.load_default(size=11), "tiny": ImageFont.load_default(size=10)}
     for i, usage in enumerate(panels[:2]):
-        _draw_stats_panel(image, i * (SPLIT_PANEL_H + 4), usage, fonts)
+        drawer(image, i * (SPLIT_PANEL_H + 4), usage, fonts)
     ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)
     return image
+
+
+def _render_stats_frame(panels: list[dict]) -> Image.Image:
+    return _render_panel_view(panels, _draw_stats_panel)
+
+
+def _render_breakdown_frame(panels: list[dict]) -> Image.Image:
+    return _render_panel_view(panels, _draw_breakdown_panel)
+
+
+def _render_hours_frame(panels: list[dict]) -> Image.Image:
+    return _render_panel_view(panels, _draw_hours_panel)
 
 
 def render_stats(panels: list[dict]) -> bytes:
@@ -1022,10 +1129,30 @@ def render_stats(panels: list[dict]) -> bytes:
     return _encode_gif([_render_stats_frame(panels)])
 
 
+def render_breakdown(panels: list[dict]) -> bytes:
+    return _encode_gif([_render_breakdown_frame(panels)])
+
+
+def render_hours(panels: list[dict]) -> bytes:
+    return _encode_gif([_render_hours_frame(panels)])
+
+
 def push_stats(
     ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
 ) -> None:
     upload(ip, render_stats(panels), filename, "image/gif", show, cancel)
+
+
+def push_breakdown(
+    ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
+) -> None:
+    upload(ip, render_breakdown(panels), filename, "image/gif", show, cancel)
+
+
+def push_hours(
+    ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
+) -> None:
+    upload(ip, render_hours(panels), filename, "image/gif", show, cancel)
 
 
 
@@ -1233,7 +1360,9 @@ def push_usage(
 ) -> None:
     """Render and upload `usage` as `filename`; `show=False` uploads without switching the screen to it."""
     rotating = animation in ("auto", "random")
-    if rotating:
+    if rotating and usage.get("working"):  # its agent is busy: the mascot works too (and that isn't a rotation pick)
+        animation, rotating = WORKING_ANIMATION.get(usage.get("title", "Claude"), "idle"), False
+    elif rotating:
         animation = _pick_animation(usage)
     gif_bytes = render_animation(usage, animation)
     upload(ip, gif_bytes, filename, "image/gif", show, cancel)

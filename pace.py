@@ -8,8 +8,9 @@ from datetime import datetime
 DEFAULT_WINDOW_MIN = {"current": 300, "weekly": 10080}
 MIN_ELAPSED = 0.08  # too early in a window to say anything useful (fraction of the window)
 MIN_PCT = 2.0  # likewise when almost nothing has been used
-LOOKBACK_MIN = {"current": 30, "weekly": 360}  # how far back "your recent pace" looks
-MIN_SPAN_MIN = 5  # recent readings must span at least this long to give a rate
+LOOKBACK_MIN = {"current": 30, "weekly": 1440}  # how far back "your recent pace" looks (the week: the last day)
+MIN_SPAN_MIN = 5  # recent readings must span at least this long to give a rate...
+MIN_SPAN_SHARE = 0.25  # ...and at least this share of the look-back, so a short burst isn't stretched over days
 
 
 def project(pct: float | None, reset_at: datetime | None, now: datetime, window_min: float,
@@ -45,7 +46,7 @@ def recent_rate(history: list, reset_epoch: float | None, now_epoch: float, look
         return None
     (t0, p0), (t1, p1) = min(points), max(points)
     span = (t1 - t0) / 60
-    if span < MIN_SPAN_MIN or p1 <= p0:
+    if span < max(MIN_SPAN_MIN, lookback_min * MIN_SPAN_SHARE) or p1 <= p0:
         return None
     return (p1 - p0) / span
 

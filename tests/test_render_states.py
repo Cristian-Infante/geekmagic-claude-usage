@@ -352,6 +352,241 @@ class StatsViewTests(unittest.TestCase):
         self.assertEqual(g._fit(draw, "short", font, 220), "short")
 
 
+def sample_activity(**override):
+    base = {
+        "24h": {"requests": 40, "sessions": 2}, "7d": {"requests": 400, "sessions": 9},
+        "days": [{"date": f"2026-10-{2 + i:02d}", "requests": 10 * i} for i in range(7)],
+        "projects": [{"name": "Acme App", "requests": 200}, {"name": "Storefront/frontend", "requests": 120}, {"name": "Docs", "requests": 60}],
+        "models": [{"name": "Opus 5.5", "requests": 280}, {"name": "Sonnet 5", "requests": 100}, {"name": "Haiku 4.5", "requests": 20}],
+        "total": 400, "hours": [0, 0, 0, 0, 0, 0, 0, 5, 20, 40, 60, 80, 100, 90, 70, 50, 30, 20, 10, 5, 0, 0, 0, 0],
+    }
+    return {**base, **override}
+
+
+class BreakdownViewTests(unittest.TestCase):
+    TOP, BOTTOM = (0, 0, 240, 118), (0, 122, 240, 240)
+    ROWS = (10, 42, 230, 118)
+
+    def panels(self, **extra):
+        return [{**usage(9, 14), "activity": sample_activity(), **extra},
+                {**usage(7, 1, title="Codex"), "activity": sample_activity(), **extra}]
+
+    def test_renders_a_still_gif_with_both_providers_in_their_colours(self):
+        from io import BytesIO
+        from PIL import Image
+        gif = g.render_breakdown(self.panels())
+        self.assertEqual(Image.open(BytesIO(gif)).n_frames, 1)
+        frame = g._render_breakdown_frame(self.panels())
+        self.assertTrue(has_colour(frame, g.THEMES["Claude"]["body"], self.TOP))
+        self.assertTrue(has_colour(frame, g.THEMES["Codex"]["body"], self.BOTTOM))
+
+    def test_projects_use_the_providers_colour_and_models_the_secondary_one(self):
+        frame = g._render_breakdown_frame(self.panels())
+        theme = g.THEMES["Claude"]
+        left, right = (10, 42, 118, 118), (126, 42, 230, 118)
+        self.assertTrue(has_colour(frame, theme["body"], left))
+        self.assertTrue(has_colour(frame, theme["weekly"], right))
+        self.assertFalse(has_colour(frame, theme["weekly"], left))
+
+    def test_bar_lengths_follow_the_shares(self):
+        frame = g._render_breakdown_frame(self.panels())
+        body = g._hex_rgb(g.THEMES["Claude"]["body"])
+
+        def bar_width(row):  # the coloured stretch of one row's bar (the row's name is above it)
+            y = 42 + row * 25 + 16
+            return sum(1 for x in range(10, 118) if frame.getpixel((x, y)) == body)
+
+        first, second, third = (bar_width(i) for i in range(3))  # 50%, 30%, 15% of 104 px
+        self.assertGreater(first, second)
+        self.assertGreater(second, third)
+        self.assertAlmostEqual(first, 52, delta=4)
+        self.assertAlmostEqual(second, 31, delta=4)
+
+    def test_percentages_and_names_are_drawn(self):
+        frame = g._render_breakdown_frame(self.panels())
+        self.assertTrue(has_similar_colour(frame, g.TEXT, (10, 40, 118, 60), at_least=15), "a project name")
+        self.assertTrue(has_similar_colour(frame, g.MUTED, (85, 40, 118, 60), at_least=6), "its percentage")
+
+    def test_a_long_name_is_shortened_and_never_runs_into_the_next_column(self):
+        long = sample_activity(projects=[{"name": "A-very-very-long-project-name-indeed", "requests": 400}])
+        frame = g._render_breakdown_frame([{**usage(9, 14), "activity": long}])
+        gap = frame.crop((119, 42, 125, 60))  # the gutter between the two columns
+        self.assertIsNone(gap.convert("L").point(lambda v: 255 if v > 60 else 0).getbbox())
+
+    def test_tiny_shares_say_less_than_one_percent(self):
+        activity = sample_activity(total=10000, projects=[{"name": "Big", "requests": 9990}, {"name": "Tiny", "requests": 3}])
+        frame = g._render_breakdown_frame([{**usage(1, 1), "activity": activity}])  # must render
+        self.assertLess(usage_stats_shares(activity)[1][1], 0.01)
+        self.assertTrue(has_similar_colour(frame, g.MUTED, (85, 66, 118, 84), at_least=6), "'<1%' beside the tiny one")
+
+    def test_messages_for_counting_no_logs_and_an_empty_week(self):
+        counting = g._render_breakdown_frame([{**usage(1, 1), "activity": None}])
+        nothing = g._render_breakdown_frame([{**usage(1, 1), "activity": {}}])
+        quiet = g._render_breakdown_frame([{**usage(1, 1), "activity": sample_activity(total=0, projects=[], models=[])}])
+        self.assertEqual(len({counting.tobytes(), nothing.tobytes(), quiet.tobytes()}), 3, "three different messages")
+        for frame in (counting, nothing, quiet):
+            self.assertTrue(has_similar_colour(frame, g.MUTED, (10, 36, 230, 62), at_least=10))
+            self.assertFalse(has_colour(frame, g.THEMES["Claude"]["body"], (10, 60, 230, 118)))
+
+    def test_a_stale_panel_is_dimmed_and_dated_and_the_other_untouched(self):
+        fresh = g._render_breakdown_frame(self.panels())
+        stale = g._render_breakdown_frame([{**self.panels()[0], "stale": True}, self.panels()[1]])
+        brightest = lambda im: max(ch[1] for ch in im.crop(self.ROWS).getextrema())
+        self.assertLess(brightest(stale), brightest(fresh) * 0.7)
+        self.assertTrue(has_similar_colour(stale, g.STATE_COLORS["warn"], (110, 2, 240, 28)))
+        self.assertEqual(stale.crop(self.BOTTOM).tobytes(), fresh.crop(self.BOTTOM).tobytes())
+
+
+def usage_stats_shares(activity):
+    import usage_stats
+    return usage_stats.shares(activity["projects"], activity["total"], 3)
+
+
+class HoursViewTests(unittest.TestCase):
+    TOP, BOTTOM = (0, 0, 240, 118), (0, 122, 240, 240)
+    CHART = (12, 46, 228, 104)
+
+    def panels(self, **extra):
+        return [{**usage(9, 14), "activity": sample_activity(), **extra},
+                {**usage(7, 1, title="Codex"), "activity": sample_activity(), **extra}]
+
+    def test_renders_a_still_gif_with_both_providers(self):
+        from io import BytesIO
+        from PIL import Image
+        self.assertEqual(Image.open(BytesIO(g.render_hours(self.panels()))).n_frames, 1)
+        frame = g._render_hours_frame(self.panels())
+        self.assertTrue(has_colour(frame, g.THEMES["Claude"]["body"], self.CHART))
+        self.assertTrue(has_colour(frame, g.THEMES["Codex"]["body"], (12, 168, 228, 226)))
+
+    def test_the_caption_names_the_busiest_stretch(self):
+        import usage_stats
+        window = usage_stats.busiest_hours(sample_activity()["hours"])
+        self.assertEqual(usage_stats.hours_text(window), "12-2 PM")
+        frame = g._render_hours_frame(self.panels())
+        self.assertTrue(has_similar_colour(frame, g.TEXT, (10, 26, 230, 42), at_least=25))
+
+    def test_the_busiest_two_hours_are_highlighted_and_the_rest_dimmer(self):
+        frame = g._render_hours_frame([self.panels()[0]])
+        bright = g._hex_rgb(g.THEMES["Claude"]["body"])
+        dim = tuple(g._blend(g.THEMES["Claude"]["body"], g.BG, 0.45))
+
+        def colour_at(hour):  # the bar's colour just above its baseline
+            return frame.getpixel((12 + hour * 9 + 3, 100))
+
+        self.assertEqual(colour_at(12), bright)
+        self.assertEqual(colour_at(13), bright)
+        self.assertEqual(colour_at(11), dim, "busy, but not in the busiest stretch")
+        self.assertEqual(colour_at(15), dim)
+        self.assertEqual(colour_at(2), g._hex_rgb(g.PILL_BG), "no activity: a flat stub")
+
+    def test_bar_heights_follow_the_requests(self):
+        frame = g._render_hours_frame([self.panels()[0]])
+
+        def height(hour):
+            x, y, h = 12 + hour * 9 + 3, 101, 0
+            while frame.getpixel((x, y)) != g._hex_rgb(g.BG) and h < 60:  # up to the background above the bar
+                y, h = y - 1, h + 1
+            return h
+
+        self.assertGreater(height(12), height(9))
+        self.assertGreater(height(9), height(18))
+        self.assertLessEqual(height(2), 3)
+
+    def test_a_window_crossing_midnight_highlights_both_sides(self):
+        hours = [0] * 24
+        hours[23], hours[0], hours[12] = 50, 60, 10
+        frame = g._render_hours_frame([{**usage(1, 1), "activity": sample_activity(hours=hours)}])
+        bright = g._hex_rgb(g.THEMES["Claude"]["body"])
+        self.assertEqual(frame.getpixel((12 + 23 * 9 + 3, 100)), bright)
+        self.assertEqual(frame.getpixel((12 + 0 * 9 + 3, 100)), bright)
+        self.assertNotEqual(frame.getpixel((12 + 12 * 9 + 3, 100)), bright)
+
+    def test_the_hour_axis_is_labelled(self):
+        frame = g._render_hours_frame(self.panels())
+        self.assertTrue(has_similar_colour(frame, g.MUTED, (12, 102, 228, 114), at_least=20))
+
+    def test_messages_when_there_is_nothing_to_show(self):
+        counting = g._render_hours_frame([{**usage(1, 1), "activity": None}])
+        nothing = g._render_hours_frame([{**usage(1, 1), "activity": {}}])
+        quiet = g._render_hours_frame([{**usage(1, 1), "activity": sample_activity(hours=[0] * 24)}])
+        self.assertEqual(len({counting.tobytes(), nothing.tobytes(), quiet.tobytes()}), 3)
+        for frame in (counting, nothing, quiet):
+            self.assertFalse(has_colour(frame, g.THEMES["Claude"]["body"], self.CHART), "no chart without data")
+
+    def test_a_stale_panel_is_dimmed(self):
+        fresh = g._render_hours_frame(self.panels())
+        stale = g._render_hours_frame([{**self.panels()[0], "stale": True}, self.panels()[1]])
+        brightest = lambda im: max(ch[1] for ch in im.crop((10, 40, 230, 116)).getextrema())
+        self.assertLess(brightest(stale), brightest(fresh) * 0.7)
+        self.assertEqual(stale.crop(self.BOTTOM).tobytes(), fresh.crop(self.BOTTOM).tobytes())
+
+
+class WorkingIndicatorTests(unittest.TestCase):
+    DOT = g._hex_rgb(g.WORKING_COLOR)
+
+    def screen(self, **extra):
+        return g._render_frame({**usage(36, 17), **extra})
+
+    def test_the_single_screen_shows_a_green_working_badge_only_while_working(self):
+        box = (140, 4, 234, 28)
+        on, off = self.screen(working=True), self.screen()
+        self.assertTrue(has_similar_colour(on, g.WORKING_COLOR, box, at_least=15))
+        self.assertFalse(has_similar_colour(off, g.WORKING_COLOR, box))
+
+    def test_codex_keeps_its_resets_chip_beside_the_badge(self):
+        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 12}}
+        screen = g._render_frame({**codex, "working": True})
+        self.assertTrue(has_similar_colour(screen, g.WORKING_COLOR, (140, 4, 234, 20), at_least=10), "the badge, up top")
+        self.assertTrue(has_similar_colour(screen, g.THEMES["Codex"]["weekly"], (140, 21, 234, 38), at_least=8), "the chip below it")
+
+    def test_every_view_of_both_providers_can_show_the_dot(self):
+        dot_pixels = lambda im, box: sum(1 for p in im.crop(box).getdata() if p == self.DOT)
+        busy = {**usage(9, 14), "working": True, "activity": sample_activity()}
+        idle = {**busy, "working": False}
+        for name, render, box in (
+            ("stats", g._render_stats_frame, (150, 4, 232, 30)),
+            ("breakdown", g._render_breakdown_frame, (150, 4, 232, 30)),
+            ("hours", g._render_hours_frame, (150, 4, 232, 30)),
+            ("split", g._render_split_frame, (150, 4, 232, 34)),
+        ):
+            self.assertGreater(dot_pixels(render([busy, idle]), box), 10, f"{name}: the dot")
+            self.assertEqual(dot_pixels(render([idle, idle]), box), 0, f"{name}: no dot when idle")
+
+    def test_the_dot_is_not_drawn_on_a_stale_panel(self):
+        stale = g._render_stats_frame([{**usage(9, 14), "working": True, "stale": True, "activity": sample_activity()}])
+        self.assertEqual(sum(1 for p in stale.crop((150, 4, 232, 30)).getdata() if p == self.DOT), 0)
+
+    def test_a_busy_agents_mascot_works_instead_of_rotating(self):
+        from unittest.mock import patch
+        g._recent_animations.clear()
+        with patch.object(g, "upload"), patch.object(g, "render_animation", wraps=g.render_animation) as render:
+            g.push_usage("x", {**usage(9, 14), "working": True}, "auto")
+            g.push_usage("x", {**usage(7, 1, title="Codex"), "working": True}, "random")
+            g.push_usage("x", usage(9, 14), "auto")  # idle again: back to a random one
+        self.assertEqual([c.args[1] for c in render.call_args_list[:2]], ["typing", "code"])
+        self.assertEqual(len(g._recent_animations["Claude"]), 1, "only the idle push counts for the rotation")
+        self.assertNotIn("Codex", g._recent_animations)
+
+    def test_a_pinned_animation_wins_over_the_working_one(self):
+        from unittest.mock import patch
+        with patch.object(g, "upload"), patch.object(g, "render_animation", wraps=g.render_animation) as render:
+            g.push_usage("x", {**usage(9, 14), "working": True}, "coffee")
+        self.assertEqual(render.call_args.args[1], "coffee")
+
+    def test_split_panels_use_the_working_animations_without_touching_the_history(self):
+        from unittest.mock import patch
+        g._recent_animations.clear()
+        panels = [{**usage(9, 14), "working": True}, {**usage(7, 1, title="Codex"), "working": True}]
+        with patch.object(g, "upload"), patch.object(g, "render_split", wraps=g.render_split) as render:
+            g.push_split("x", panels, "split.gif")
+        self.assertEqual(render.call_args.args[1], ["typing", "code"])
+        self.assertEqual(g._recent_animations, {})
+
+    def test_the_working_animations_exist(self):
+        for title, name in g.WORKING_ANIMATION.items():
+            self.assertIn(name, g.ANIMATION_GROUPS[title])
+
+
 class CodexResetsRenderTests(unittest.TestCase):
     CHIP_BOX = (130, 10, 232, 32)  # top right of Codex's screen
 

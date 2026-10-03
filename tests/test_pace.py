@@ -69,6 +69,19 @@ class RecentRateTests(unittest.TestCase):
         self.assertIsNone(pace.recent_rate(self.history((now, 20)), self.RESET, now, 30), "a single reading")
         self.assertIsNone(pace.recent_rate(self.history((now - 120, 18), (now, 20)), self.RESET, now, 30), "under 5 minutes")
 
+    def test_a_short_burst_is_not_stretched_over_the_whole_look_back(self):
+        """The real case: +3 points over 45 minutes must not become a weekly pace worth days of "Full in 19h"."""
+        now = 1_000_000.0
+        burst = self.history((now - 1200, 17), (now, 20))  # 20 minutes of history
+        self.assertIsNone(pace.recent_rate(burst, self.RESET, now, pace.LOOKBACK_MIN["weekly"]), "a day's look-back needs 6 h of it")
+        self.assertAlmostEqual(pace.recent_rate(burst, self.RESET, now, pace.LOOKBACK_MIN["current"]), 3 / 20,
+                               msg="but it is plenty for a 30-minute look-back")
+        day = self.history((now - 8 * 3600, 12), (now - 4 * 3600, 16), (now, 20))  # 8 hours: enough
+        self.assertAlmostEqual(pace.recent_rate(day, self.RESET, now, pace.LOOKBACK_MIN["weekly"]), 8 / 480)
+
+    def test_the_weekly_look_back_is_a_day_and_the_session_one_half_an_hour(self):
+        self.assertEqual(pace.LOOKBACK_MIN, {"current": 30, "weekly": 1440})
+
     def test_flat_or_falling_is_no_rate(self):
         now = 1_000_000.0
         self.assertIsNone(pace.recent_rate(self.history((now - 900, 20), (now, 20)), self.RESET, now, 30))
