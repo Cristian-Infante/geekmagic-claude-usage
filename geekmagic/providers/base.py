@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from geekmagic.model import Usage
+
 
 class Provider(ABC):
     key: str  # "claude": what is stored on disk and used as a file name
@@ -17,9 +19,9 @@ class Provider(ABC):
     install_hint: str  # what to tell someone whose CLI isn't installed
 
     @abstractmethod
-    def fetch(self) -> dict:
-        """Its current usage (see geekmagic.render for the shape). Raises UsageError, or SignInNeeded when signing in
-        again is what's needed. Never spends a token."""
+    def fetch(self) -> Usage:
+        """Its current usage. Raises UsageError, or SignInNeeded when signing in again is what's needed. Never spends
+        a token."""
 
     @abstractmethod
     def find_cli(self) -> str | None:

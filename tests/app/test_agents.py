@@ -158,21 +158,22 @@ class AgentTests(AppTestCase):
         for _ in range(2):
             app.agents.update("claude", self.waiting())
         single = app.screen.flag("claude", usage())
-        self.assertEqual((single["working"], single["waiting"]), (True, True))
+        self.assertEqual((single.working, single.waiting), (True, True))
         other = app.screen.flag("codex", usage(title="Codex"))
-        self.assertEqual((other["working"], other["waiting"]), (False, False))
-        panels = app.screen.flag("split", {"panels": [usage(), usage(title="Codex")]})["panels"]
-        self.assertEqual([(p["working"], p["waiting"]) for p in panels], [(True, True), (False, False)])
+        self.assertEqual((other.working, other.waiting), (False, False))
+        panels = app.screen.flag("split", [usage(), usage(title="Codex")])
+        self.assertEqual([(p.working, p.waiting) for p in panels], [(True, True), (False, False)])
 
     def test_the_flag_reaches_what_gets_drawn(self):
         app = self.make()
         app.agents.agent = {"claude": {"working": True}}
-        single = app.screen.flag("claude", usage())
-        self.assertTrue(single["working"])
-        self.assertFalse(app.screen.flag("codex", usage(title="Codex"))["working"])
-        panels = app.screen.flag("split", {"panels": [usage(), usage(title="Codex")]})["panels"]
-        self.assertEqual([p["working"] for p in panels], [True, False])
-        self.assertNotIn("working", usage(), "the original reading isn't modified")
+        original = usage()
+        single = app.screen.flag("claude", original)
+        self.assertTrue(single.working)
+        self.assertFalse(app.screen.flag("codex", usage(title="Codex")).working)
+        panels = app.screen.flag("split", [usage(), usage(title="Codex")])
+        self.assertEqual([p.working for p in panels], [True, False])
+        self.assertFalse(original.working, "the original reading isn't modified")
 
     def test_the_tooltip_names_each_agent_that_is_going(self):
         app = self.make()

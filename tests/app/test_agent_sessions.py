@@ -107,7 +107,7 @@ class AgentSessionTests(AppTestCase):
         with capture_screen() as cap:
             app.screen.upload("codex", usage(title="Codex"))
             app.screen.upload("claude", usage())
-        self.assertEqual([u["working"] for u, _ in cap.single], [True, False])
+        self.assertEqual([u.working for u, _ in cap.single], [True, False])
 
     def test_an_agent_change_redraws_from_what_is_already_read_without_querying_again(self):
         app = self.make()

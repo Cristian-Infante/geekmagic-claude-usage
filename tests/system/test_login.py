@@ -3,11 +3,13 @@ import json
 import os
 import subprocess
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from geekmagic.providers import PROVIDERS, claude, codex
 from geekmagic.render.views import error as error_view
 from geekmagic.errors import SignInNeeded, UsageError
+from geekmagic.model import ErrorScreen
 from geekmagic.system import login
 
 
@@ -106,10 +108,9 @@ class SignedOutDetectionTests(unittest.TestCase):
 
     def test_the_error_screen_asks_for_the_sign_in(self):
         from datetime import datetime
-        usage = {"title": "Codex", "error": "Codex could not read account limits. Not signed in?",
-                 "now": datetime.now().astimezone()}
-        plain = error_view.render_error_frame(usage)
-        asking = error_view.render_error_frame({**usage, "signin": True})
+        screen = ErrorScreen("Codex", "Codex could not read account limits. Not signed in?", datetime.now().astimezone())
+        plain = error_view.render_error_frame(screen)
+        asking = error_view.render_error_frame(replace(screen, signin=True))
         self.assertEqual(plain.size, (240, 240))
         self.assertNotEqual(plain.tobytes(), asking.tobytes(), "the heading says what to do")
 

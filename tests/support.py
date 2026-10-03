@@ -17,6 +17,7 @@ except Exception as e:  # pystray needs a desktop session
     raise unittest.SkipTest(f"the tray app can't be imported here: {e}")
 
 from geekmagic import paths
+from geekmagic.model import Usage, Window
 from geekmagic.app import config
 from geekmagic.device.client import GeekMagicDevice
 from geekmagic.providers import PROVIDERS
@@ -25,11 +26,14 @@ from geekmagic.render.views import Rendered
 from geekmagic.system import notifier
 
 
-def usage(current=10.0, weekly=5.0, title="Claude", **extra) -> dict:
-    """A provider's reading, as the screens and the app take it."""
+def usage(current=10.0, weekly=5.0, title="Claude", *, current_reset=None, weekly_reset=None, **extra) -> Usage:
+    """A provider's reading, as the screens and the app take it. `extra` sets any other field of Usage
+    (working, waiting, stale, activity, codex_extra, pace...)."""
     now = datetime.now().astimezone()
-    return {"title": title, "current_pct": current, "current_reset": now + timedelta(hours=2),
-            "weekly_pct": weekly, "weekly_reset": now + timedelta(days=3), "now": now, **extra}
+    return Usage(
+        title=title, now=now,
+        current=Window(current, current_reset or now + timedelta(hours=2)),
+        weekly=Window(weekly, weekly_reset or now + timedelta(days=3)), **extra)
 
 
 def failing(error: Exception):
@@ -56,9 +60,9 @@ class Capture:
     """What the app rendered and sent to the device while a `capture_screen` block was open."""
 
     def __init__(self) -> None:
-        self.single: list[tuple[dict, str]] = []  # (reading, animation asked for) of each single-provider screen
-        self.errors: list[dict] = []  # each "can't read it" screen
-        self.panels: list[tuple[str, list[dict], str]] = []  # (view, the readings, animation asked for) of each view of two
+        self.single: list[tuple[Usage, str]] = []  # (reading, animation asked for) of each single-provider screen
+        self.errors: list = []  # each "can't read it" screen (an ErrorScreen)
+        self.panels: list[tuple[str, list[Usage], str]] = []  # (view, the readings, animation asked for) of each view of two
         self.uploads: list[str] = []  # file names uploaded to the device
         self.shown: list[str] = []  # file names pinned on its screen
 

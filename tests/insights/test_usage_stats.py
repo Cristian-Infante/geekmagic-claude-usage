@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from geekmagic.model import CodexExtra, Usage, Window
 from geekmagic.providers import codex
 from geekmagic.render import components
 from geekmagic.render import mascots
@@ -319,17 +320,20 @@ class CodexResetsTests(unittest.TestCase):
 
     def test_free_resets_and_when_the_next_one_expires(self):
         extra = self.extra()
-        self.assertEqual((extra["free_resets"], extra["next_reset_expires_days"]), (3, 12))
+        self.assertEqual((extra.free_resets, extra.next_reset_expires_days), (3, 12))
 
     def test_used_ones_do_not_count_towards_the_expiry(self):
-        self.assertEqual(self.extra(days=1, status="used")["next_reset_expires_days"], 31)
+        self.assertEqual(self.extra(days=1, status="used").next_reset_expires_days, 31)
 
     def test_missing_fields_are_fine(self):
-        self.assertEqual(codex._codex_extra({}), {"free_resets": 0, "next_reset_expires_days": None})
-        self.assertEqual(codex._codex_extra({"_reset_credits": "garbage"}), {"free_resets": 0, "next_reset_expires_days": None})
+        self.assertEqual(codex._codex_extra({}), CodexExtra(free_resets=0, next_reset_expires_days=None))
+        self.assertEqual(codex._codex_extra({"_reset_credits": "garbage"}), CodexExtra(free_resets=0, next_reset_expires_days=None))
+
+    def usage(self, title="Codex", codex_extra=None):
+        return Usage(title=title, current=Window(), weekly=Window(), now=datetime.now().astimezone(), codex_extra=codex_extra)
 
     def chip(self, **codex_extra):
-        return components.resets_chip({"title": "Codex", "codex_extra": codex_extra})
+        return components.resets_chip(self.usage(codex_extra=CodexExtra(**codex_extra)))
 
     def test_chip_text_and_urgency(self):
         self.assertEqual(self.chip(free_resets=3, next_reset_expires_days=12), ("3 resets · 12d", mascots.THEMES["Codex"]["weekly"]))
@@ -340,8 +344,8 @@ class CodexResetsTests(unittest.TestCase):
 
     def test_no_chip_without_resets_or_for_claude(self):
         self.assertIsNone(self.chip(free_resets=0, next_reset_expires_days=None))
-        self.assertIsNone(components.resets_chip({"title": "Codex"}))
-        self.assertIsNone(components.resets_chip({"title": "Claude", "codex_extra": {"free_resets": 3}}))
+        self.assertIsNone(components.resets_chip(self.usage()))
+        self.assertIsNone(components.resets_chip(self.usage("Claude", CodexExtra(free_resets=3))))
 
 
 if __name__ == "__main__":

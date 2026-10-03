@@ -7,9 +7,11 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 from geekmagic.app import config
 from geekmagic.insights import agent_activity
+from geekmagic.model import ErrorScreen, Usage
 from geekmagic.providers import KEY_OF, PROVIDERS, TITLES
 
 log = logging.getLogger("tray")
@@ -40,16 +42,17 @@ class AgentMonitor:
     def waiting(self, provider: str | None) -> bool:
         return bool(provider and self.agent.get(provider, {}).get("waiting"))
 
-    def flag(self, key: str, usage: dict, panel_views) -> dict:
+    def flag(self, key: str, data, panel_views):
         """What's about to be drawn, with each provider's "its agent is working right now" flag set from the latest
-        look at its logs (the screen draws a tag and the mascot works). `key` is a provider's, or one of the views
-        of two (`panel_views` are their keys)."""
+        look at its logs (the screen draws a tag and the mascot works). `key` is a provider's (`data` is its Usage, or
+        an ErrorScreen), or one of the views of two (`panel_views` are their keys; `data` is a list of Usage)."""
+        if isinstance(data, ErrorScreen):
+            return data
         if key in TITLES:
-            return {**usage, "working": self.working(key), "waiting": self.waiting(key)}
+            return replace(data, working=self.working(key), waiting=self.waiting(key))
         if key in panel_views:
-            return {**usage, "panels": [{**p, "working": self.working(_key_of(p)), "waiting": self.waiting(_key_of(p))}
-                                        for p in usage["panels"]]}
-        return usage
+            return [replace(p, working=self.working(_key_of(p)), waiting=self.waiting(_key_of(p))) for p in data]
+        return data
 
     # --- polling ----------------------------------------------------------------------------------------------------
 
@@ -154,5 +157,5 @@ class AgentMonitor:
         return [f"{TITLES[p]} te espera" if self.waiting(p) else f"{TITLES[p]} trabajando" for p in TITLES if self.working(p)]
 
 
-def _key_of(panel: dict) -> str | None:
-    return KEY_OF.get(panel.get("title"))
+def _key_of(panel: Usage) -> str | None:
+    return KEY_OF.get(panel.title)

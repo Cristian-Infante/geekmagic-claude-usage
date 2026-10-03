@@ -9,6 +9,7 @@ from collections.abc import Callable
 from geekmagic.app import config
 from geekmagic.errors import SignInNeeded, UsageError
 from geekmagic.insights import alerts, pace
+from geekmagic.model import Usage
 from geekmagic.providers import PROVIDERS, TITLES
 
 log = logging.getLogger("tray")
@@ -20,12 +21,12 @@ class UsageHistory:
     def __init__(self) -> None:
         self.points: dict[str, list] = {}  # "provider/window" -> [[epoch, pct, reset epoch], ...]
 
-    def record(self, provider: str, usage: dict) -> None:
+    def record(self, provider: str, usage: Usage) -> None:
         """Keep the readings of each window (when the percentage changed, or every few minutes) so the recent pace can
         be measured. Readings of an earlier window are dropped as soon as it resets."""
         now = time.time()
         for window, _ in config.WINDOWS:
-            pct, reset = usage.get(f"{window}_pct"), usage.get(f"{window}_reset")
+            pct, reset = usage.window(window).pct, usage.window(window).reset
             if pct is None or reset is None:
                 continue
             points = self.points.setdefault(f"{provider}/{window}", [])
@@ -34,10 +35,10 @@ class UsageHistory:
                 points.append([now, pct, reset.timestamp()])
             del points[:-config.HISTORY_MAX]
 
-    def rates(self, provider: str, usage: dict) -> dict[str, float | None]:
+    def rates(self, provider: str, usage: Usage) -> dict[str, float | None]:
         rates = {}
         for window, _ in config.WINDOWS:
-            reset = usage.get(f"{window}_reset")
+            reset = usage.window(window).reset
             rates[window] = pace.recent_rate(
                 self.points.get(f"{provider}/{window}", []), reset.timestamp() if reset else None,
                 time.time(), pace.LOOKBACK_MIN[window],
@@ -60,10 +61,10 @@ class AlertTracker:
         self.save = save
         self.state: dict[str, dict] = {}  # "provider/window" -> {"level": 0..2, "pct": last reading}
 
-    def check(self, provider: str, usage: dict) -> None:
+    def check(self, provider: str, usage: Usage) -> None:
         """Notify when a window newly reaches 80 % / 95 %, and when it resets after that."""
         for window, label in config.WINDOWS:
-            pct = usage.get(f"{window}_pct")
+            pct = usage.window(window).pct
             if pct is None:
                 continue
             key = f"{provider}/{window}"
@@ -97,14 +98,14 @@ class UsageService:
         self.alert_tracker = alert_tracker
         self.lock = lock
         self.last_fetch: dict[str, float] = {}
-        self.last_good: dict[str, tuple[dict, float]] = {}  # provider -> (last usage that was read OK, when)
+        self.last_good: dict[str, tuple[Usage, float]] = {}  # provider -> (last usage that was read OK, when)
         self.stale: set[str] = set()  # providers whose image on the device is the dimmed "no fresh data" one
         self.errors: dict[str, str] = {}  # provider -> why its last read failed (gone once a read works)
         self.needs_login: set[str] = set()  # providers whose last read failed because you're signed out
         self.on_read: Callable[[str], None] = lambda provider: None
         self.on_failure: Callable[[str, Exception], None] = lambda provider, error: None
 
-    def fetch(self, provider: str) -> dict | None:
+    def fetch(self, provider: str) -> Usage | None:
         """Query the provider. Every successful read also feeds the alerts; a failing one may mark the data stale."""
         self.last_fetch[provider] = time.monotonic()
         try:
@@ -134,7 +135,7 @@ class UsageService:
         good = self.last_good.get(provider)
         return good is not None and time.monotonic() - good[1] < within
 
-    def stale_candidate(self, provider: str) -> dict | None:
+    def stale_candidate(self, provider: str) -> Usage | None:
         """The last good reading, if it has been too long since it was refreshed and it isn't already shown as stale."""
         good = self.last_good.get(provider)
         if not good or provider in self.stale:

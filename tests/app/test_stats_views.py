@@ -39,8 +39,8 @@ class StatsViewTests(AppTestCase):
         key, panels, _ = cap.panels[0]
         self.assertEqual(key, "stats")
         self.assertEqual((cap.uploads[0], cap.shown[0]), ("stats-usage-a.gif", "stats-usage-a.gif"))
-        self.assertEqual([p["title"] for p in panels], ["Claude", "Codex"])
-        self.assertEqual([p["activity"] for p in panels], [ACTIVITY["claude"], ACTIVITY["codex"]],
+        self.assertEqual([p.title for p in panels], ["Claude", "Codex"])
+        self.assertEqual([p.activity for p in panels], [ACTIVITY["claude"], ACTIVITY["codex"]],
                          "the same kind of numbers for both")
         self.assertEqual(sorted(calls), ["claude", "codex"], "each counted once, not once per cycle")
 
@@ -56,7 +56,7 @@ class StatsViewTests(AppTestCase):
         app = self.make()
         app.screen.animation = "coffee"
         with capture_screen() as cap:
-            app.screen.upload("split", {"panels": [usage()]})
+            app.screen.upload("split", [usage()])
         self.assertEqual([animation for _, _, animation in cap.panels], ["coffee"])
 
 
@@ -92,7 +92,7 @@ class BreakdownAndHoursViewTests(AppTestCase):
         app = self.make()
         with capture_screen() as cap:
             for key in (STATS, BREAKDOWN, HOURS):
-                app.screen.upload(key, {"panels": [usage()]})
+                app.screen.upload(key, [usage()])
         self.assertEqual([key for key, _, _ in cap.panels], ["stats", "breakdown", "hours"])
         self.assertEqual(cap.uploads, ["stats-usage-a.gif", "breakdown-usage-a.gif", "hours-usage-a.gif"])
         self.assertEqual(len({type(views.PANEL_VIEWS[k]) for k in (STATS, BREAKDOWN, HOURS)}), 3, "one View class each")
@@ -111,7 +111,7 @@ class BreakdownAndHoursViewTests(AppTestCase):
                 self.assertEqual(app.scheduler.update_panels(mode), "ok")
         self.assertEqual([key for key, _, _ in cap.panels], ["breakdown", "hours"])
         for _, panels, _ in cap.panels:
-            self.assertEqual([p["activity"] for p in panels], [activity["claude"], activity["codex"]])
+            self.assertEqual([p.activity for p in panels], [activity["claude"], activity["codex"]])
         self.assertEqual(sorted(calls), ["claude", "codex"], "both views share one count")
 
 

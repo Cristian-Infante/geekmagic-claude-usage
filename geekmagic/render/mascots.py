@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw
 
+from geekmagic.model import Usage
 from geekmagic.render.palette import ACCENT, CURRENT_ACCENT, WEEKLY_ACCENT
 
 
@@ -39,15 +40,15 @@ CODEX_BITMAP = (
 INK = "#0F0D0B"
 
 
-# Per-provider look, picked by usage["title"]: mascot bitmap + body colour, and the two bar accents.
+# Per-provider look, picked by usage.title: mascot bitmap + body colour, and the two bar accents.
 THEMES = {
     "Claude": {"bitmap": CLAUDE_BITMAP, "body": ACCENT, "current": CURRENT_ACCENT, "weekly": WEEKLY_ACCENT},
     "Codex": {"bitmap": CODEX_BITMAP, "body": "#4F9DFF", "current": "#4F9DFF", "weekly": "#B79CFF"},
 }
 
 
-def theme_for(usage: dict) -> dict:
-    return THEMES.get(usage.get("title"), THEMES["Claude"])
+def theme_for(usage: Usage) -> dict:
+    return THEMES.get(usage.title, THEMES["Claude"])
 
 
 def draw_mascot(image: Image.Image, top_left: tuple[int, int], cell_size: int, theme: dict | None = None) -> None:

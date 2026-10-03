@@ -482,6 +482,7 @@ patterns used and how to add a provider or a view):
 
 | Folder | What it is |
 |---|---|
+| `model.py` | The typed objects everything passes around: `Usage` (two `Window`s, the pace, the flags...), `ErrorScreen`. |
 | `providers/` | One class per AI tool behind a common `Provider` interface: read its usage, find its CLI, count its logs, sign in. |
 | `insights/` | What the numbers mean: pace, alert thresholds, activity counted from the local logs, is an agent working. |
 | `render/` | How it looks: mascots, animations, and one class per screen (`views/`). Readings in, pictures out. |

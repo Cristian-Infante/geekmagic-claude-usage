@@ -6,6 +6,7 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw
 
+from geekmagic.model import Usage
 from geekmagic.insights import alerts, pace, usage_stats
 from geekmagic.render.mascots import THEMES, draw_mascot, theme_for
 from geekmagic.render.palette import (
@@ -30,14 +31,14 @@ def format_delta(reset_at: datetime | None, now: datetime) -> str:
     return f"Resets in {hours}h {minutes}m"
 
 
-def resets_chip(usage: dict) -> tuple[str, str] | None:
+def resets_chip(usage: Usage) -> tuple[str, str] | None:
     """(text, colour) for the free-resets note in the corner of Codex's screen: "3 resets · 2d" (days until the
     next one expires; yellow from 3 days, red from 1 so it gets used in time)."""
-    extra = usage.get("codex_extra") or {}
-    count = extra.get("free_resets")
-    if usage.get("title") != "Codex" or not count:
+    extra = usage.codex_extra
+    count = extra.free_resets if extra else 0
+    if usage.title != "Codex" or not count:
         return None
-    days = extra.get("next_reset_expires_days")
+    days = extra.next_reset_expires_days
     text = f"{count} reset{'' if count == 1 else 's'}" + (f" · {days}d" if days is not None else "")
     color = STATE_COLORS["crit"] if days is not None and days <= 1 else STATE_COLORS["warn"] if days is not None and days <= 3 else THEMES["Codex"]["weekly"]
     return text, color
@@ -76,11 +77,11 @@ def draw_week_chart(draw, days: list[dict], *, left: int, right: int, baseline: 
         draw.text((x0 + bar_w / 2 - w / 2, baseline + 1), name, font=fonts["tiny"], fill=TEXT if today else MUTED)
 
 
-def busy_style(usage: dict) -> tuple[str, str] | None:
+def busy_style(usage: Usage) -> tuple[str, str] | None:
     """(label, colour) of the badge for an agent that is waiting for you or working, else None. Waiting wins."""
-    if usage.get("waiting"):
+    if usage.waiting:
         return "Waiting", WAITING_COLOR
-    if usage.get("working"):
+    if usage.working:
         return "Working", WORKING_COLOR
     return None
 
@@ -91,7 +92,7 @@ def draw_working_dot(draw, x: float, y: float, color: str = WORKING_COLOR) -> No
     draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
 
 
-def draw_busy_tag(draw, y: float, usage: dict, font, left_of: float | None = None) -> None:
+def draw_busy_tag(draw, y: float, usage: Usage, font, left_of: float | None = None) -> None:
     """In a panel header, the dot and its word ("Working" / "Waiting"). A dot alone is easy to miss on a small screen;
     the word makes it unmistakable. By default it's right-aligned on the line under the clock (the split view's
     header is crowded: beside the clock it ran into the provider's name); with `left_of` it sits just left of that x
@@ -109,26 +110,26 @@ def draw_busy_tag(draw, y: float, usage: dict, font, left_of: float | None = Non
         draw.text((left_of - 16 - width, y), label, font=font, fill=color)
 
 
-def draw_panel_header(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+def draw_panel_header(image: Image.Image, top: int, usage: Usage, fonts: dict) -> None:
     """The header every two-provider view shares: small mascot, name, time (or the working dot beside it)."""
     theme = theme_for(usage)
     draw = ImageDraw.Draw(image)
     draw_mascot(image, (10, top + 8), 2, theme)
-    draw.text((46, top + 5), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
-    if not usage.get("stale"):
-        updated = clock(usage["now"])
+    draw.text((46, top + 5), usage.title, font=fonts["title"], fill=TEXT)
+    if not usage.stale:
+        updated = clock(usage.now)
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
         draw_busy_tag(draw, top + 10, usage, fonts["small"], left_of=230 - width)
 
 
-def dim_stale_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+def dim_stale_panel(image: Image.Image, top: int, usage: Usage, fonts: dict) -> None:
     """A panel whose numbers couldn't be refreshed: everything dimmed, and since when."""
-    if not usage.get("stale"):
+    if not usage.stale:
         return
     box = (0, top, WIDTH, top + SPLIT_PANEL_H)
     image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
-    text = f"! stale since {clock(usage['now'])}"
+    text = f"! stale since {clock(usage.now)}"
     draw = ImageDraw.Draw(image)
     draw.text((230 - draw.textlength(text, font=fonts["small"]), top + 10), text, font=fonts["small"], fill=STATE_COLORS["warn"])
 
@@ -189,11 +190,11 @@ def draw_pace(draw, pace_info, *, right: int, y: int, left_end: float, font) -> 
         draw.text((right - width, y), text, font=font, fill=STATE_COLORS.get(state, MUTED))
 
 
-def window_pace(usage: dict, window: str):
+def window_pace(usage: Usage, window: str):
     """(text, state) projection for a usage window, or None (also None while the numbers are stale)."""
-    if usage.get("stale"):
+    if usage.stale:
         return None
-    return pace.describe((usage.get("pace") or {}).get(window))
+    return pace.describe(usage.pace.get(window))
 
 
 def draw_split_row(draw, *, top, label, percent, reset_text, accent, fonts, pace_info=None) -> None:

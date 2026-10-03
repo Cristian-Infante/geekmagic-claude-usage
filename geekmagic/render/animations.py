@@ -11,6 +11,7 @@ import random
 
 from PIL import Image, ImageDraw
 
+from geekmagic.model import Usage
 from geekmagic.render.mascots import CODEX_BITMAP, INK, MASCOT_TOP
 from geekmagic.render.props import (
     LAPTOP_BEZEL, MUG_BITMAP, draw_bulb, draw_laptop, draw_mug, laptop_geometry,
@@ -344,20 +345,20 @@ class Rotation:
         return {"animations": self.dump()}
 
 
-def busy_animation(usage: dict) -> str | None:
+def busy_animation(usage: Usage) -> str | None:
     """What the mascot does while its agent is busy (None when it isn't)."""
-    title = usage.get("title", "Claude")
-    if usage.get("waiting"):
+    title = usage.title
+    if usage.waiting:
         return WAITING_ANIMATION.get(title, "idle")
-    if usage.get("working"):
+    if usage.working:
         return WORKING_ANIMATION.get(title, "idle")
     return None
 
 
-def animation_for(usage: dict, requested: str, rotation: Rotation) -> str:
+def animation_for(usage: Usage, requested: str, rotation: Rotation) -> str:
     """The animation a provider's screen should play: the one asked for if it's one of that provider's, else (for
     "auto" / "random") what its busy agent calls for, else a random one from its own set."""
-    title = usage.get("title", "Claude")
+    title = usage.title
     group = ANIMATION_GROUPS.get(title, ANIMATION_GROUPS["Claude"])
     if busy_animation(usage) and requested in ("auto", "random"):
         return busy_animation(usage)  # its agent is busy: the mascot works (or asks for you) too

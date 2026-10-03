@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from PIL import Image
 
+from geekmagic.model import Usage, Window
 from geekmagic.render import animations
 from geekmagic.render import gif
 from geekmagic.render import palette
@@ -13,10 +14,10 @@ from geekmagic.render.views import single
 from geekmagic.render.views import split
 
 
-def reading(title="Claude", pct=36.0):
+def reading(title="Claude", pct=36.0, **extra) -> Usage:
     now = datetime.now().astimezone()
-    return {"title": title, "current_pct": pct, "current_reset": now + timedelta(minutes=103),
-            "weekly_pct": 17.0, "weekly_reset": now + timedelta(days=5), "now": now}
+    return Usage(title=title, current=Window(pct, now + timedelta(minutes=103)),
+                 weekly=Window(17.0, now + timedelta(days=5)), now=now, **extra)
 
 
 class GifSizeTests(unittest.TestCase):
@@ -48,7 +49,7 @@ class GifSizeTests(unittest.TestCase):
         self.assertLess(len(data), 40 * 1024)
 
     def test_the_stills_are_tiny(self):
-        panels = [{**reading(), "activity": None}, {**reading("Codex"), "activity": None}]
+        panels = [reading(activity=None), reading("Codex", activity=None)]
         self.assertLess(len(panel_views.render_stats(panels)), 20 * 1024)
 
 

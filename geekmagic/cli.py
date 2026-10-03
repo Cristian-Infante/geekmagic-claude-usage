@@ -41,8 +41,8 @@ def push_usage(device: GeekMagicDevice, usage: dict, animation: str, filename: s
         _cleanup_old_images(device)
         _cleaned_up.add(device.ip)
     print(
-        f"[{usage['now']:%H:%M:%S}] pushed [{rendered.animations[0]}] ({len(rendered.gif) / 1024:.1f} KB) — "
-        f"current {usage['current_pct']}% / weekly {usage['weekly_pct']}%"
+        f"[{usage.now:%H:%M:%S}] pushed [{rendered.animations[0]}] ({len(rendered.gif) / 1024:.1f} KB) — "
+        f"current {usage.current.pct}% / weekly {usage.weekly.pct}%"
     )
 
 

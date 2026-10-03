@@ -11,6 +11,7 @@ from datetime import datetime
 from geekmagic.app import config
 from geekmagic.app.screen import Screen
 from geekmagic.app.usage import UsageService
+from geekmagic.model import ErrorScreen
 from geekmagic.providers import PROVIDERS, TITLES
 from geekmagic.system import login
 
@@ -71,7 +72,7 @@ class SignInCoordinator:
         self.screen.error_shown.pop(provider, None)
         self.wake.set()
 
-    def error_usage(self, provider: str) -> dict | None:
+    def error_usage(self, provider: str) -> ErrorScreen | None:
         """What to put on a provider's screen when it has never been read: the reason it failed. None when there's
         nothing to say, or the screen already says it (it would only be uploaded again every cycle for nothing)."""
         message = self.usage.errors.get(provider)
@@ -80,5 +81,5 @@ class SignInCoordinator:
         if (self.screen.error_shown.get(provider) == message and provider in self.screen.slots
                 and provider not in self.screen.outdated):
             return None
-        return {"title": TITLES[provider], "error": message, "now": datetime.now().astimezone(),
-                "signin": self.usage.signed_out(provider) and provider not in self.missing}
+        return ErrorScreen(title=TITLES[provider], message=message, now=datetime.now().astimezone(),
+                           signin=self.usage.signed_out(provider) and provider not in self.missing)

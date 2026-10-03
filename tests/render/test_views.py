@@ -1,9 +1,11 @@
 """Rendering of the alert colours and of the dimmed "no fresh data" image."""
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from PIL import Image, ImageDraw, ImageFont, ImageStat
 
+from geekmagic.model import CodexExtra, Usage, Window
 from geekmagic.render.views import PANEL_VIEWS, SINGLE
 from geekmagic.render import animations
 from geekmagic.render import components
@@ -23,12 +25,10 @@ def hex_to_rgb(color: str):
     return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
 
 
-def usage(current, weekly=10.0, title="Claude", **extra):
+def usage(current, weekly=10.0, title="Claude", **extra) -> Usage:
     now = datetime.now().astimezone().replace(hour=14, minute=57, second=0, microsecond=0)
-    return {
-        "title": title, "current_pct": current, "current_reset": now + timedelta(hours=2),
-        "weekly_pct": weekly, "weekly_reset": now + timedelta(days=3), "now": now, **extra,
-    }
+    return Usage(title=title, current=Window(current, now + timedelta(hours=2)),
+                 weekly=Window(weekly, now + timedelta(days=3)), now=now, **extra)
 
 
 def has_colour(image, color, box):
@@ -55,7 +55,7 @@ class ClockTests(unittest.TestCase):
     def test_the_screens_use_it(self):
         import inspect
         for module in (single, split, components, panel_views):
-            self.assertNotIn("usage['now']:%H:%M}", inspect.getsource(module), "a 24-hour time slipped back onto a screen")
+            self.assertNotIn("usage.now:%H:%M}", inspect.getsource(module), "a 24-hour time slipped back onto a screen")
 
 
 class AlertColourTests(unittest.TestCase):
@@ -203,8 +203,8 @@ class PaceRenderTests(unittest.TestCase):
     def paced(self, current, left_min, **extra):
         from geekmagic.insights import pace
         now = datetime.now().astimezone().replace(hour=14, minute=57, second=0, microsecond=0)
-        u = {"title": "Claude", "current_pct": current, "current_reset": now + timedelta(minutes=left_min),
-             "weekly_pct": 10.0, "weekly_reset": now + timedelta(days=5), "now": now, **extra}
+        u = Usage(title="Claude", current=Window(current, now + timedelta(minutes=left_min)),
+                  weekly=Window(10.0, now + timedelta(days=5)), now=now, **extra)
         return pace.annotate(u)
 
     def test_a_projection_that_runs_out_is_drawn_in_the_alert_colour(self):
@@ -218,9 +218,9 @@ class PaceRenderTests(unittest.TestCase):
 
     def test_no_projection_means_nothing_extra_on_screen(self):
         early_usage = self.paced(30, 290)  # 10 minutes into the session
-        self.assertIsNone(early_usage["pace"]["current"])
+        self.assertIsNone(early_usage.pace["current"])
         early = single.render_frame(early_usage)
-        plain = single.render_frame({**early_usage, "pace": {"current": None, "weekly": None}})
+        plain = single.render_frame(replace(early_usage, pace={"current": None, "weekly": None}))
         self.assertEqual(early.crop(self.PACE_BOX).tobytes(), plain.crop(self.PACE_BOX).tobytes(), "session: nothing added")
 
     def test_stale_numbers_show_no_projection(self):
@@ -241,7 +241,7 @@ class PaceRenderTests(unittest.TestCase):
         self.assertIsNotNone(canvas.getbbox(), "with room it is drawn")
 
     def test_split_rows_show_the_projection_too(self):
-        panel = [self.paced(80, 180), {**self.paced(30, 290)}]
+        panel = [self.paced(80, 180), self.paced(30, 290)]
         frame = split.render_split_frame(panel)
         self.assertTrue(has_similar_colour(frame, palette.STATE_COLORS["crit"], (150, 60, 232, 76), at_least=4))
 
@@ -255,13 +255,13 @@ class StatsViewTests(unittest.TestCase):
         return {"24h": {"requests": requests[-1], "sessions": 1}, "7d": {"requests": sum(requests), "sessions": sessions}, "days": days}
 
     def claude(self, **extra):
-        return {**usage(9, 14), "activity": self.activity(), **extra}
+        return usage(9, 14, **{"activity": self.activity(), **extra})
 
     def codex(self, **extra):
-        return {**usage(7, 1, title="Codex"), "activity": self.activity((100, 90, 5, 0, 60, 300, 26), 17), **extra}
+        return usage(7, 1, title="Codex", **{"activity": self.activity((100, 90, 5, 0, 60, 300, 26), 17), **extra})
 
     def test_both_panels_have_exactly_the_same_layout(self):
-        frame = panel_views.render_stats_frame([self.claude(), self.codex(activity=self.claude()["activity"])])
+        frame = panel_views.render_stats_frame([self.claude(), self.codex(activity=self.claude().activity)])
         top, bottom = frame.crop((0, 40, 240, 118)), frame.crop((0, 162, 240, 240))  # everything below each header
         # same numbers, so the only differences are the providers' colours: the shape of what's drawn is identical
         shape = lambda im: [(x, y) for y in range(im.height) for x in range(im.width) if im.getpixel((x, y)) != palette.hex_rgb(palette.BG)]
@@ -276,7 +276,7 @@ class StatsViewTests(unittest.TestCase):
         self.assertIn(palette.hex_rgb(bright), pixels, "today's bar in the full colour")
         self.assertIn(tuple(dim), pixels, "earlier days dimmer")
         weekday_names = [s for s in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")]
-        self.assertEqual(len(panel["activity"]["days"]), len(weekday_names))
+        self.assertEqual(len(panel.activity["days"]), len(weekday_names))
 
     def test_the_tallest_day_is_the_tallest_bar_and_empty_days_stay_flat(self):
         canvas = Image.new("RGB", (240, 240), palette.BG)
@@ -332,7 +332,7 @@ class StatsViewTests(unittest.TestCase):
         self.assertTrue(has_colour(normal, mascots.THEMES["Claude"]["body"], (10, 60, 230, 108)))
 
     def test_it_copes_with_missing_data(self):
-        panel_views.render_stats_frame([{**usage(1, 1)}, {**usage(1, 1, title="Codex")}])
+        panel_views.render_stats_frame([usage(1, 1), usage(1, 1, title="Codex")])
         panel_views.render_stats_frame([self.claude()])
         panel_views.render_stats_frame([])
         panel_views.render_stats_frame([self.claude(activity=self.activity((0, 0, 0, 0, 0, 0, 0)))])  # nothing in a week
@@ -371,8 +371,8 @@ class BreakdownViewTests(unittest.TestCase):
     ROWS = (10, 42, 230, 118)
 
     def panels(self, **extra):
-        return [{**usage(9, 14), "activity": sample_activity(), **extra},
-                {**usage(7, 1, title="Codex"), "activity": sample_activity(), **extra}]
+        return [usage(9, 14, **{"activity": sample_activity(), **extra}),
+                usage(7, 1, title="Codex", **{"activity": sample_activity(), **extra})]
 
     def test_renders_a_still_gif_with_both_providers_in_their_colours(self):
         from io import BytesIO
@@ -412,20 +412,20 @@ class BreakdownViewTests(unittest.TestCase):
 
     def test_a_long_name_is_shortened_and_never_runs_into_the_next_column(self):
         long = sample_activity(projects=[{"name": "A-very-very-long-project-name-indeed", "requests": 400}])
-        frame = panel_views.render_breakdown_frame([{**usage(9, 14), "activity": long}])
+        frame = panel_views.render_breakdown_frame([usage(9, 14, activity=long)])
         gap = frame.crop((119, 42, 125, 60))  # the gutter between the two columns
         self.assertIsNone(gap.convert("L").point(lambda v: 255 if v > 60 else 0).getbbox())
 
     def test_tiny_shares_say_less_than_one_percent(self):
         activity = sample_activity(total=10000, projects=[{"name": "Big", "requests": 9990}, {"name": "Tiny", "requests": 3}])
-        frame = panel_views.render_breakdown_frame([{**usage(1, 1), "activity": activity}])  # must render
+        frame = panel_views.render_breakdown_frame([usage(1, 1, activity=activity)])  # must render
         self.assertLess(usage_stats_shares(activity)[1][1], 0.01)
         self.assertTrue(has_similar_colour(frame, palette.MUTED, (85, 66, 118, 84), at_least=6), "'<1%' beside the tiny one")
 
     def test_messages_for_counting_no_logs_and_an_empty_week(self):
-        counting = panel_views.render_breakdown_frame([{**usage(1, 1), "activity": None}])
-        nothing = panel_views.render_breakdown_frame([{**usage(1, 1), "activity": {}}])
-        quiet = panel_views.render_breakdown_frame([{**usage(1, 1), "activity": sample_activity(total=0, projects=[], models=[])}])
+        counting = panel_views.render_breakdown_frame([usage(1, 1, activity=None)])
+        nothing = panel_views.render_breakdown_frame([usage(1, 1, activity={})])
+        quiet = panel_views.render_breakdown_frame([usage(1, 1, activity=sample_activity(total=0, projects=[], models=[]))])
         self.assertEqual(len({counting.tobytes(), nothing.tobytes(), quiet.tobytes()}), 3, "three different messages")
         for frame in (counting, nothing, quiet):
             self.assertTrue(has_similar_colour(frame, palette.MUTED, (10, 36, 230, 62), at_least=10))
@@ -433,7 +433,7 @@ class BreakdownViewTests(unittest.TestCase):
 
     def test_a_stale_panel_is_dimmed_and_dated_and_the_other_untouched(self):
         fresh = panel_views.render_breakdown_frame(self.panels())
-        stale = panel_views.render_breakdown_frame([{**self.panels()[0], "stale": True}, self.panels()[1]])
+        stale = panel_views.render_breakdown_frame([replace(self.panels()[0], stale=True), self.panels()[1]])
         brightest = lambda im: max(ch[1] for ch in im.crop(self.ROWS).getextrema())
         self.assertLess(brightest(stale), brightest(fresh) * 0.7)
         self.assertTrue(has_similar_colour(stale, palette.STATE_COLORS["warn"], (110, 2, 240, 28)))
@@ -450,8 +450,8 @@ class HoursViewTests(unittest.TestCase):
     CHART = (12, 46, 228, 104)
 
     def panels(self, **extra):
-        return [{**usage(9, 14), "activity": sample_activity(), **extra},
-                {**usage(7, 1, title="Codex"), "activity": sample_activity(), **extra}]
+        return [usage(9, 14, **{"activity": sample_activity(), **extra}),
+                usage(7, 1, title="Codex", **{"activity": sample_activity(), **extra})]
 
     def test_renders_a_still_gif_with_both_providers(self):
         from io import BytesIO
@@ -498,7 +498,7 @@ class HoursViewTests(unittest.TestCase):
     def test_a_window_crossing_midnight_highlights_both_sides(self):
         hours = [0] * 24
         hours[23], hours[0], hours[12] = 50, 60, 10
-        frame = panel_views.render_hours_frame([{**usage(1, 1), "activity": sample_activity(hours=hours)}])
+        frame = panel_views.render_hours_frame([usage(1, 1, activity=sample_activity(hours=hours))])
         bright = palette.hex_rgb(mascots.THEMES["Claude"]["body"])
         self.assertEqual(frame.getpixel((12 + 23 * 9 + 3, 100)), bright)
         self.assertEqual(frame.getpixel((12 + 0 * 9 + 3, 100)), bright)
@@ -509,16 +509,16 @@ class HoursViewTests(unittest.TestCase):
         self.assertTrue(has_similar_colour(frame, palette.MUTED, (12, 102, 228, 114), at_least=20))
 
     def test_messages_when_there_is_nothing_to_show(self):
-        counting = panel_views.render_hours_frame([{**usage(1, 1), "activity": None}])
-        nothing = panel_views.render_hours_frame([{**usage(1, 1), "activity": {}}])
-        quiet = panel_views.render_hours_frame([{**usage(1, 1), "activity": sample_activity(hours=[0] * 24)}])
+        counting = panel_views.render_hours_frame([usage(1, 1, activity=None)])
+        nothing = panel_views.render_hours_frame([usage(1, 1, activity={})])
+        quiet = panel_views.render_hours_frame([usage(1, 1, activity=sample_activity(hours=[0] * 24))])
         self.assertEqual(len({counting.tobytes(), nothing.tobytes(), quiet.tobytes()}), 3)
         for frame in (counting, nothing, quiet):
             self.assertFalse(has_colour(frame, mascots.THEMES["Claude"]["body"], self.CHART), "no chart without data")
 
     def test_a_stale_panel_is_dimmed(self):
         fresh = panel_views.render_hours_frame(self.panels())
-        stale = panel_views.render_hours_frame([{**self.panels()[0], "stale": True}, self.panels()[1]])
+        stale = panel_views.render_hours_frame([replace(self.panels()[0], stale=True), self.panels()[1]])
         brightest = lambda im: max(ch[1] for ch in im.crop((10, 40, 230, 116)).getextrema())
         self.assertLess(brightest(stale), brightest(fresh) * 0.7)
         self.assertEqual(stale.crop(self.BOTTOM).tobytes(), fresh.crop(self.BOTTOM).tobytes())
@@ -528,7 +528,7 @@ class WorkingIndicatorTests(unittest.TestCase):
     DOT = palette.hex_rgb(palette.WORKING_COLOR)
 
     def screen(self, **extra):
-        return single.render_frame({**usage(36, 17), **extra})
+        return single.render_frame(usage(36, 17, **extra))
 
     def test_the_single_screen_shows_a_green_working_badge_only_while_working(self):
         box = (140, 4, 234, 28)
@@ -537,15 +537,15 @@ class WorkingIndicatorTests(unittest.TestCase):
         self.assertFalse(has_similar_colour(off, palette.WORKING_COLOR, box))
 
     def test_codex_keeps_its_resets_chip_beside_the_badge(self):
-        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 12}}
-        screen = single.render_frame({**codex, "working": True})
+        codex = usage(36, 17, title="Codex", codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=12))
+        screen = single.render_frame(replace(codex, working=True))
         self.assertTrue(has_similar_colour(screen, palette.WORKING_COLOR, (140, 4, 234, 20), at_least=10), "the badge, up top")
         self.assertTrue(has_similar_colour(screen, mascots.THEMES["Codex"]["weekly"], (140, 21, 234, 38), at_least=8), "the chip below it")
 
     def test_every_view_of_both_providers_can_show_the_dot(self):
         dot_pixels = lambda im, box: sum(1 for p in im.crop(box).getdata() if p == self.DOT)
-        busy = {**usage(9, 14), "working": True, "activity": sample_activity()}
-        idle = {**busy, "working": False}
+        busy = usage(9, 14, working=True, activity=sample_activity())
+        idle = replace(busy, working=False)
         for name, render, box in (
             ("stats", panel_views.render_stats_frame, (150, 4, 232, 30)),
             ("breakdown", panel_views.render_breakdown_frame, (150, 4, 232, 30)),
@@ -556,24 +556,24 @@ class WorkingIndicatorTests(unittest.TestCase):
             self.assertEqual(dot_pixels(render([idle, idle]), box), 0, f"{name}: no dot when idle")
 
     def test_the_dot_is_not_drawn_on_a_stale_panel(self):
-        stale = panel_views.render_stats_frame([{**usage(9, 14), "working": True, "stale": True, "activity": sample_activity()}])
+        stale = panel_views.render_stats_frame([usage(9, 14, working=True, stale=True, activity=sample_activity())])
         self.assertEqual(sum(1 for p in stale.crop((150, 4, 232, 30)).getdata() if p == self.DOT), 0)
 
     def test_a_busy_agents_mascot_works_instead_of_rotating(self):
         rotation = animations.Rotation()
-        busy_claude = SINGLE.render({**usage(9, 14), "working": True}, "auto", rotation)
-        busy_codex = SINGLE.render({**usage(7, 1, title="Codex"), "working": True}, "random", rotation)
+        busy_claude = SINGLE.render(usage(9, 14, working=True), "auto", rotation)
+        busy_codex = SINGLE.render(usage(7, 1, title="Codex", working=True), "random", rotation)
         idle = SINGLE.render(usage(9, 14), "auto", rotation)  # idle again: back to a random one
         self.assertEqual([busy_claude.animations[0], busy_codex.animations[0]], ["typing", "code"])
         self.assertEqual((busy_claude.picks, busy_codex.picks), ([], []), "a working mascot isn't a rotation pick")
         self.assertEqual([title for title, _ in idle.picks], ["Claude"])
 
     def test_a_pinned_animation_wins_over_the_working_one(self):
-        rendered = SINGLE.render({**usage(9, 14), "working": True}, "coffee", animations.Rotation())
+        rendered = SINGLE.render(usage(9, 14, working=True), "coffee", animations.Rotation())
         self.assertEqual(rendered.animations, ["coffee"])
 
     def test_split_panels_use_the_working_animations_without_touching_the_history(self):
-        panels = [{**usage(9, 14), "working": True}, {**usage(7, 1, title="Codex"), "working": True}]
+        panels = [usage(9, 14, working=True), usage(7, 1, title="Codex", working=True)]
         rendered = SPLIT.render(panels, "auto", animations.Rotation())
         self.assertEqual(rendered.animations, ["typing", "code"])
         self.assertEqual(rendered.picks, [])
@@ -589,7 +589,7 @@ class WaitingIndicatorTests(unittest.TestCase):
     AMBER = palette.hex_rgb(palette.WAITING_COLOR)
 
     def screen(self, **extra):
-        return single.render_frame({**usage(36, 17), **extra})
+        return single.render_frame(usage(36, 17, **extra))
 
     def test_waiting_shows_an_amber_badge_instead_of_the_green_one(self):
         box = (140, 4, 234, 28)
@@ -599,21 +599,21 @@ class WaitingIndicatorTests(unittest.TestCase):
         self.assertTrue(has_similar_colour(self.screen(working=True), palette.WORKING_COLOR, box, at_least=15))
 
     def test_the_two_badges_say_different_words(self):
-        self.assertEqual(components.busy_style({"working": True}), ("Working", palette.WORKING_COLOR))
-        self.assertEqual(components.busy_style({"working": True, "waiting": True}), ("Waiting", palette.WAITING_COLOR))
-        self.assertIsNone(components.busy_style({}))
-        self.assertIsNone(components.busy_style({"working": False, "waiting": False}))
+        self.assertEqual(components.busy_style(usage(1, working=True)), ("Working", palette.WORKING_COLOR))
+        self.assertEqual(components.busy_style(usage(1, working=True, waiting=True)), ("Waiting", palette.WAITING_COLOR))
+        self.assertIsNone(components.busy_style(usage(1)))
+        self.assertIsNone(components.busy_style(usage(1, working=False, waiting=False)))
 
     def test_waiting_wins_the_animation_too(self):
-        self.assertEqual(animations.busy_animation({"title": "Claude", "working": True}), "typing")
-        self.assertEqual(animations.busy_animation({"title": "Claude", "working": True, "waiting": True}), "eureka")
-        self.assertEqual(animations.busy_animation({"title": "Codex", "working": True, "waiting": True}), "sparkle")
-        self.assertIsNone(animations.busy_animation({"title": "Codex"}))
+        self.assertEqual(animations.busy_animation(usage(1, title="Claude", working=True)), "typing")
+        self.assertEqual(animations.busy_animation(usage(1, title="Claude", working=True, waiting=True)), "eureka")
+        self.assertEqual(animations.busy_animation(usage(1, title="Codex", working=True, waiting=True)), "sparkle")
+        self.assertIsNone(animations.busy_animation(usage(1, title="Codex")))
 
     def test_every_view_shows_the_amber_dot(self):
         dots = lambda im, box: sum(1 for p in im.crop(box).getdata() if p == self.AMBER)
-        waiting = {**usage(9, 14), "working": True, "waiting": True, "activity": sample_activity()}
-        idle = {**waiting, "working": False, "waiting": False}
+        waiting = usage(9, 14, working=True, waiting=True, activity=sample_activity())
+        idle = replace(waiting, working=False, waiting=False)
         for name, render, box in (("stats", panel_views.render_stats_frame, (150, 4, 232, 30)),
                                   ("breakdown", panel_views.render_breakdown_frame, (150, 4, 232, 30)),
                                   ("hours", panel_views.render_hours_frame, (150, 4, 232, 30)),
@@ -623,16 +623,16 @@ class WaitingIndicatorTests(unittest.TestCase):
 
     def test_rendering_uses_the_waiting_animation_and_leaves_the_rotation_alone(self):
         rotation = animations.Rotation()
-        waiting = {**usage(9, 14), "working": True, "waiting": True}
+        waiting = usage(9, 14, working=True, waiting=True)
         single_screen = SINGLE.render(waiting, "auto", rotation)
         self.assertEqual((single_screen.animations, single_screen.picks), (["eureka"], []))
-        both = SPLIT.render([waiting, {**usage(7, 1, title="Codex")}], "auto", rotation)
+        both = SPLIT.render([waiting, usage(7, 1, title="Codex")], "auto", rotation)
         self.assertEqual(both.animations[0], "eureka")
         self.assertEqual([title for title, _ in both.picks], ["Codex"], "only the idle panel counts for the rotation")
 
     def test_the_codex_resets_chip_still_fits_under_the_waiting_badge(self):
-        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 12},
-                 "working": True, "waiting": True}
+        codex = usage(36, 17, title="Codex", codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=12),
+                      working=True, waiting=True)
         screen = single.render_frame(codex)
         self.assertTrue(has_similar_colour(screen, mascots.THEMES["Codex"]["weekly"], (140, 21, 234, 38), at_least=8))
 
@@ -641,31 +641,31 @@ class CodexResetsRenderTests(unittest.TestCase):
     CHIP_BOX = (130, 10, 232, 32)  # top right of Codex's screen
 
     def screen(self, title="Codex", **extra):
-        return single.render_frame({**usage(36, 17, title=title), **extra})
+        return single.render_frame(usage(36, 17, title=title, **extra))
 
     def test_the_chip_shows_on_codex_screen_in_urgency_colours(self):
-        calm = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 12})
-        soon = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 3})
-        today = self.screen(codex_extra={"free_resets": 1, "next_reset_expires_days": 1})
+        calm = self.screen(codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=12))
+        soon = self.screen(codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=3))
+        today = self.screen(codex_extra=CodexExtra(free_resets=1, next_reset_expires_days=1))
         self.assertTrue(has_similar_colour(calm, mascots.THEMES["Codex"]["weekly"], self.CHIP_BOX, at_least=8))
         self.assertTrue(has_similar_colour(soon, palette.STATE_COLORS["warn"], self.CHIP_BOX, at_least=8))
         self.assertTrue(has_similar_colour(today, palette.STATE_COLORS["crit"], self.CHIP_BOX, at_least=8))
         self.assertFalse(has_similar_colour(calm, palette.STATE_COLORS["crit"], self.CHIP_BOX))
 
     def test_no_chip_without_resets_and_never_on_claude_or_in_the_split_and_stats_views(self):
-        none = self.screen(codex_extra={"free_resets": 0, "next_reset_expires_days": None})
+        none = self.screen(codex_extra=CodexExtra(free_resets=0, next_reset_expires_days=None))
         plain = self.screen()
         self.assertEqual(none.crop(self.CHIP_BOX).tobytes(), plain.crop(self.CHIP_BOX).tobytes())
-        claude = self.screen(title="Claude", codex_extra={"free_resets": 3, "next_reset_expires_days": 1})
+        claude = self.screen(title="Claude", codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=1))
         self.assertFalse(has_similar_colour(claude, palette.STATE_COLORS["crit"], self.CHIP_BOX))
-        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 1}}
+        codex = usage(36, 17, title="Codex", codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=1))
         both = split.render_split_frame([usage(10, 10), codex])
         stats = panel_views.render_stats_frame([usage(10, 10), codex])
         for view in (both, stats):
             self.assertFalse(has_similar_colour(view, palette.STATE_COLORS["crit"], (120, 122, 240, 150)), "resets belong to Codex's own screen")
 
     def test_the_chip_does_not_collide_with_the_title(self):
-        frame = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 12})
+        frame = self.screen(codex_extra=CodexExtra(free_resets=3, next_reset_expires_days=12))
         title_box = (62, 6, 128, 38)  # where "Codex" is
         chip_in_title = has_similar_colour(frame, mascots.THEMES["Codex"]["weekly"], title_box, at_least=1)
         self.assertFalse(chip_in_title)

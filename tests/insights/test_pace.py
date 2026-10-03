@@ -3,31 +3,32 @@ import unittest
 from datetime import datetime, timedelta
 
 from geekmagic.insights import pace
+from geekmagic.model import Usage, Window
 
 NOW = datetime(2026, 10, 2, 14, 57).astimezone()
 
 
-def usage(current=None, current_left_min=None, weekly=None, weekly_left_h=None, **extra):
-    return {
-        "now": NOW, "current_pct": current, "weekly_pct": weekly,
-        "current_reset": NOW + timedelta(minutes=current_left_min) if current_left_min is not None else None,
-        "weekly_reset": NOW + timedelta(hours=weekly_left_h) if weekly_left_h is not None else None, **extra,
-    }
+def usage(current=None, current_left_min=None, weekly=None, weekly_left_h=None, current_window_min=None, **extra):
+    return Usage(
+        title="Claude", now=NOW,
+        current=Window(current, NOW + timedelta(minutes=current_left_min) if current_left_min is not None else None,
+                       current_window_min),
+        weekly=Window(weekly, NOW + timedelta(hours=weekly_left_h) if weekly_left_h is not None else None), **extra)
 
 
 class ProjectTests(unittest.TestCase):
     def test_steady_pace_projects_to_the_end_of_the_window(self):
         # 3.5 h into a 5 h session at 62%: 62 / 210 min per minute, 90 minutes to go
         p = pace.project(62, NOW + timedelta(minutes=90), NOW, 300)
-        self.assertAlmostEqual(p["end"], 62 + 62 / 210 * 90, places=3)
-        self.assertFalse(p["hits_limit"])
-        self.assertIsNone(p["minutes_to_limit"])
+        self.assertAlmostEqual(p.end, 62 + 62 / 210 * 90, places=3)
+        self.assertFalse(p.hits_limit)
+        self.assertIsNone(p.minutes_to_limit)
 
     def test_heading_past_100_says_when(self):
         # 2 h in at 80%: 40%/h, so 20 points left last 30 minutes
         p = pace.project(80, NOW + timedelta(minutes=180), NOW, 300)
-        self.assertTrue(p["hits_limit"])
-        self.assertAlmostEqual(p["minutes_to_limit"], 30, places=3)
+        self.assertTrue(p.hits_limit)
+        self.assertAlmostEqual(p.minutes_to_limit, 30, places=3)
 
     def test_too_early_or_too_little_used_gives_nothing(self):
         self.assertIsNone(pace.project(30, NOW + timedelta(minutes=290), NOW, 300), "10 minutes into the window")
@@ -38,18 +39,18 @@ class ProjectTests(unittest.TestCase):
     def test_a_window_that_already_ended_or_is_full_gives_nothing_alarming(self):
         self.assertIsNone(pace.project(50, NOW - timedelta(minutes=1), NOW, 300))
         full = pace.project(100, NOW + timedelta(minutes=60), NOW, 300)
-        self.assertFalse(full["hits_limit"], "already at the limit: nothing left to predict")
+        self.assertFalse(full.hits_limit, "already at the limit: nothing left to predict")
 
     def test_a_recent_burst_beats_the_average(self):
         calm = pace.project(40, NOW + timedelta(minutes=150), NOW, 300)  # 150 min in: 40/150 per min
         burst = pace.project(40, NOW + timedelta(minutes=150), NOW, 300, recent_rate=0.8)
-        self.assertGreater(burst["rate"], calm["rate"])
-        self.assertEqual(burst["rate"], 0.8)
-        self.assertTrue(burst["hits_limit"])
+        self.assertGreater(burst.rate, calm.rate)
+        self.assertEqual(burst.rate, 0.8)
+        self.assertTrue(burst.hits_limit)
 
     def test_a_slow_recent_rate_does_not_hide_a_heavy_start(self):
         p = pace.project(40, NOW + timedelta(minutes=150), NOW, 300, recent_rate=0.01)
-        self.assertAlmostEqual(p["rate"], 40 / 150)
+        self.assertAlmostEqual(p.rate, 40 / 150)
 
 
 class RecentRateTests(unittest.TestCase):
@@ -116,23 +117,23 @@ class DescribeTests(unittest.TestCase):
 class AnnotateTests(unittest.TestCase):
     def test_adds_a_projection_per_window_using_each_windows_length(self):
         u = pace.annotate(usage(current=62, current_left_min=90, weekly=95, weekly_left_h=24))
-        self.assertFalse(u["pace"]["current"]["hits_limit"])
-        self.assertTrue(u["pace"]["weekly"]["hits_limit"], "95% with a day of 7 left runs out")
-        calm = pace.annotate(usage(weekly=70, weekly_left_h=24))["pace"]["weekly"]
-        self.assertFalse(calm["hits_limit"], "70% with a day of 7 left is fine")
-        self.assertAlmostEqual(calm["end"], 70 + 70 / 144 * 24, places=3)  # judged on a 7-day window, not a 5-hour one
+        self.assertFalse(u.pace["current"].hits_limit)
+        self.assertTrue(u.pace["weekly"].hits_limit, "95% with a day of 7 left runs out")
+        calm = pace.annotate(usage(weekly=70, weekly_left_h=24)).pace["weekly"]
+        self.assertFalse(calm.hits_limit, "70% with a day of 7 left is fine")
+        self.assertAlmostEqual(calm.end, 70 + 70 / 144 * 24, places=3)  # judged on a 7-day window, not a 5-hour one
 
     def test_codex_reported_window_lengths_win(self):
-        a = pace.annotate(usage(current=62, current_left_min=90))["pace"]["current"]
-        b = pace.annotate(usage(current=62, current_left_min=90, window_min={"current": 600}))["pace"]["current"]
-        self.assertNotEqual(a["rate"], b["rate"])
+        a = pace.annotate(usage(current=62, current_left_min=90)).pace["current"]
+        b = pace.annotate(usage(current=62, current_left_min=90, current_window_min=600)).pace["current"]
+        self.assertNotEqual(a.rate, b.rate)
 
     def test_recent_rates_are_used(self):
         u = pace.annotate(usage(current=40, current_left_min=150), recent={"current": 0.9})
-        self.assertEqual(u["pace"]["current"]["rate"], 0.9)
+        self.assertEqual(u.pace["current"].rate, 0.9)
 
     def test_missing_windows_are_none(self):
-        self.assertEqual(pace.annotate(usage())["pace"], {"current": None, "weekly": None})
+        self.assertEqual(pace.annotate(usage()).pace, {"current": None, "weekly": None})
 
 
 if __name__ == "__main__":

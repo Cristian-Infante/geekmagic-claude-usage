@@ -1,24 +1,26 @@
 """The recent readings of each usage window, from which the pace under each bar is measured."""
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from geekmagic import paths
 from geekmagic.app import config
+from geekmagic.model import Usage, Window
 from tests.support import AppTestCase, fake_fetchers
 
 
 class UsageHistoryTests(AppTestCase):
-    def reading(self, pct, reset_in_min=150, weekly=5.0, title="Claude"):
+    def reading(self, pct, reset_in_min=150, weekly=5.0, title="Claude") -> Usage:
         now = datetime.now().astimezone()
-        return {"title": title, "current_pct": pct, "current_reset": now + timedelta(minutes=reset_in_min),
-                "weekly_pct": weekly, "weekly_reset": now + timedelta(days=3), "now": now}
+        return Usage(title=title, now=now, current=Window(pct, now + timedelta(minutes=reset_in_min)),
+                     weekly=Window(weekly, now + timedelta(days=3)))
 
     def test_readings_are_recorded_when_they_change_and_not_repeated_needlessly(self):
         history = self.make().usage.history
         first = self.reading(10)
         history.record("claude", first)
-        history.record("claude", dict(first))  # same percentage moments later
+        history.record("claude", replace(first))  # same percentage moments later
         self.assertEqual(len(history.points["claude/current"]), 1)
         history.record("claude", self.reading(12))
         self.assertEqual([p[1] for p in history.points["claude/current"]], [10, 12])
@@ -44,7 +46,7 @@ class UsageHistoryTests(AppTestCase):
         app.usage.history.points["claude/current"] = [[now - 900, 30.0, reset.timestamp()]]
         with fake_fetchers(claude=lambda: self.reading(40)):
             read = app.usage.fetch("claude")
-        rate = read["pace"]["current"]["rate"]
+        rate = read.pace["current"].rate
         self.assertGreater(rate, 40 / 150)
         self.assertAlmostEqual(rate, 10 / 15, places=1)
 

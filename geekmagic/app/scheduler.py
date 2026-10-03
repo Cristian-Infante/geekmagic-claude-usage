@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 
 from geekmagic.app import config
@@ -20,6 +21,7 @@ from geekmagic.app.screen import Screen
 from geekmagic.app.signin import SignInCoordinator
 from geekmagic.app.usage import UsageService
 from geekmagic.app.viewstate import STATS_VIEWS, ViewState
+from geekmagic.model import Usage, Window
 from geekmagic.providers import TITLES
 from geekmagic.render import views
 
@@ -55,7 +57,7 @@ class Scheduler:
         for thread in threads:
             thread.join()
 
-    def panels(self, key: str) -> list[dict]:
+    def panels(self, key: str) -> list[Usage]:
         """The two providers' latest readings for a view of both. One whose read failed keeps its last good numbers,
         dimmed and dated once they're a few minutes old; one that has never been read keeps its panel, with dashes."""
         panels = []
@@ -64,16 +66,15 @@ class Scheduler:
             good = self.usage.last_good.get(provider)
             if good is None:
                 if provider in self.usage.errors and anything:
-                    usage = {"title": TITLES[provider], "current_pct": None, "current_reset": None, "weekly_pct": None,
-                             "weekly_reset": None, "now": datetime.now().astimezone()}
+                    usage = Usage(title=TITLES[provider], current=Window(), weekly=Window(), now=datetime.now().astimezone())
                     if key in STATS_VIEWS:
-                        usage["activity"] = self.activity.stats.get(provider)
+                        usage.activity = self.activity.stats.get(provider)
                     panels.append(usage)
                 continue
             usage, read_at = good
-            usage = dict(usage, stale=True) if time.monotonic() - read_at >= config.STALE_SECONDS else dict(usage)
+            usage = replace(usage, stale=True) if time.monotonic() - read_at >= config.STALE_SECONDS else replace(usage)
             if key in STATS_VIEWS:
-                usage["activity"] = self.activity.stats.get(provider)
+                usage.activity = self.activity.stats.get(provider)
             panels.append(usage)
         return panels
 
@@ -87,7 +88,7 @@ class Scheduler:
         panels = self.panels(key)
         if not panels:
             return "error"
-        return self.screen.deliver(key, {"panels": panels})
+        return self.screen.deliver(key, panels)
 
     def update_split(self) -> str:
         return self.update_panels(views.PANEL_VIEWS["split"].key)
@@ -108,7 +109,7 @@ class Scheduler:
         self.usage.stale.add(provider)
         log.warning("no fresh %s data for %d s; showing the last reading dimmed", provider, config.STALE_SECONDS)
         try:
-            s.upload(provider, dict(usage, stale=True))
+            s.upload(provider, replace(usage, stale=True))
         except Exception:
             log.exception("could not upload the stale image (%s)", provider)
 
@@ -140,8 +141,8 @@ class Scheduler:
             if key in views.PANEL_VIEWS:
                 if key in STATS_VIEWS:
                     self.activity.refresh()
-                usage = {"panels": self.panels(key)}
-                ready = len(usage["panels"]) == len(TITLES)  # (half a view would be stored as if it were whole)
+                usage = self.panels(key)
+                ready = len(usage) == len(TITLES)  # (half a view would be stored as if it were whole)
             else:
                 good = self.usage.last_good.get(key)
                 usage, ready = (good[0] if good else None), good is not None

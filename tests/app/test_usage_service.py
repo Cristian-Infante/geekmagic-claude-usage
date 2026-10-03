@@ -18,14 +18,14 @@ class UsageServiceTests(AppTestCase):
             app.scheduler.mark_stale("claude")
             self.assertEqual(len(cap.single), 1)
             shown = cap.single[0][0]
-            self.assertTrue(shown["stale"])
-            self.assertEqual(shown["current_pct"], 40)  # the last known numbers, not made-up ones
+            self.assertTrue(shown.stale)
+            self.assertEqual(shown.current.pct, 40)  # the last known numbers, not made-up ones
 
             app.scheduler.mark_stale("claude")
             self.assertEqual(len(cap.single), 1, "already marked: don't re-upload every cycle")
 
             with fake_fetchers(claude=lambda: usage(current=41)):
-                self.assertEqual(app.usage.fetch("claude")["current_pct"], 41)
+                self.assertEqual(app.usage.fetch("claude").current.pct, 41)
             self.assertNotIn("claude", app.usage.stale)  # fresh data clears it
 
     def test_failing_fetch_marks_stale_and_returns_nothing(self):
@@ -34,7 +34,7 @@ class UsageServiceTests(AppTestCase):
         with fake_fetchers(claude=failing(UsageError("claude not logged in"))), capture_screen() as cap:
             self.assertIsNone(app.usage.fetch("claude"))
         self.assertEqual(len(cap.single), 1)
-        self.assertTrue(cap.single[0][0]["stale"])
+        self.assertTrue(cap.single[0][0].stale)
 
     def test_no_stale_upload_while_the_device_is_unreachable(self):
         app = self.make()

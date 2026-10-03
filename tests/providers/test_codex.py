@@ -69,15 +69,15 @@ assert sys.stdin.read() == ""  # No threads, prompts, or model turns were sent.
                     "secondary": {"usedPercent": 42, "resetsAt": 1900600000},
                 }},
             })
-            self.assertEqual(result["current_pct"], percent)
-            self.assertEqual(result["weekly_pct"], 42)
-            self.assertEqual(result["current_reset"].timestamp(), 1900000000)
+            self.assertEqual(result.current.pct, percent)
+            self.assertEqual(result.weekly.pct, 42)
+            self.assertEqual(result.current.reset.timestamp(), 1900000000)
             self.assertTrue(single.render_animation(result).startswith(b"GIF"))
 
     def test_secondary_only_and_server_percent_at_past_reset(self):
         result = self.query({"rateLimits": {"secondary": {"usedPercent": 17, "resetsAt": 1700000000}}})
-        self.assertIsNone(result["current_pct"])
-        self.assertEqual(result["weekly_pct"], 17)  # Do not invent a 0% reading.
+        self.assertIsNone(result.current.pct)
+        self.assertEqual(result.weekly.pct, 17)  # Do not invent a 0% reading.
         self.assertTrue(single.render_animation(result).startswith(b"GIF"))
 
     def test_missing_cli(self):

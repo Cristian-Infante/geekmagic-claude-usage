@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw, ImageFont
 
+from geekmagic.model import Usage
 from geekmagic.insights import usage_stats
 from geekmagic.render.components import (
     dim_stale_panel, draw_panel_header, draw_share_rows, draw_week_chart,
@@ -13,13 +14,13 @@ from geekmagic.render.mascots import theme_for
 from geekmagic.render.palette import BG, HEIGHT, MUTED, PILL_BG, SPLIT_PANEL_H, TEXT, WIDTH, blend
 
 
-def draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+def draw_stats_panel(image: Image.Image, top: int, usage: Usage, fonts: dict) -> None:
     """One provider's activity: requests and sessions for 24 h and 7 days, and requests per day over the last week.
     The very same layout and numbers for every provider, so they can be compared at a glance."""
     theme = theme_for(usage)
     draw = ImageDraw.Draw(image)
     draw_panel_header(image, top, usage, fonts)
-    activity = usage.get("activity")
+    activity = usage.activity
     if not activity:
         draw.text((10, top + 40), "No local activity logs found" if activity == {} else "Counting...",
                   font=fonts["body"], fill=MUTED)
@@ -31,13 +32,13 @@ def draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> 
     dim_stale_panel(image, top, usage, fonts)
 
 
-def draw_breakdown_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+def draw_breakdown_panel(image: Image.Image, top: int, usage: Usage, fonts: dict) -> None:
     """Where this week's requests went: the top projects on the left, the top models on the right (shares of the
     provider's own total, same layout for every provider)."""
     theme = theme_for(usage)
     draw = ImageDraw.Draw(image)
     draw_panel_header(image, top, usage, fonts)
-    activity = usage.get("activity")
+    activity = usage.activity
     if not activity or not activity.get("total"):
         draw.text((10, top + 40), "No local activity logs found" if activity == {} else
                   "Counting..." if activity is None else "No activity in the last 7 days", font=fonts["body"], fill=MUTED)
@@ -48,12 +49,12 @@ def draw_breakdown_panel(image: Image.Image, top: int, usage: dict, fonts: dict)
     dim_stale_panel(image, top, usage, fonts)
 
 
-def draw_hours_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+def draw_hours_panel(image: Image.Image, top: int, usage: Usage, fonts: dict) -> None:
     """When you work: requests for each hour of the day over the last four weeks, with the busiest stretch called out."""
     theme = theme_for(usage)
     draw = ImageDraw.Draw(image)
     draw_panel_header(image, top, usage, fonts)
-    activity = usage.get("activity")
+    activity = usage.activity
     hours = (activity or {}).get("hours")
     if not hours or not any(hours):
         draw.text((10, top + 40), "No local activity logs found" if activity == {} else
@@ -77,7 +78,7 @@ def draw_hours_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> 
 PANEL_DRAWERS = {"stats": draw_stats_panel, "breakdown": draw_breakdown_panel, "hours": draw_hours_panel}
 
 
-def render_panel_view(panels: list[dict], drawer) -> Image.Image:
+def render_panel_view(panels: list[Usage], drawer) -> Image.Image:
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
     fonts = {"title": ImageFont.load_default(size=17), "body": ImageFont.load_default(size=12),
              "small": ImageFont.load_default(size=11), "tiny": ImageFont.load_default(size=10)}
@@ -87,26 +88,26 @@ def render_panel_view(panels: list[dict], drawer) -> Image.Image:
     return image
 
 
-def render_stats_frame(panels: list[dict]) -> Image.Image:
+def render_stats_frame(panels: list[Usage]) -> Image.Image:
     return render_panel_view(panels, draw_stats_panel)
 
 
-def render_breakdown_frame(panels: list[dict]) -> Image.Image:
+def render_breakdown_frame(panels: list[Usage]) -> Image.Image:
     return render_panel_view(panels, draw_breakdown_panel)
 
 
-def render_hours_frame(panels: list[dict]) -> Image.Image:
+def render_hours_frame(panels: list[Usage]) -> Image.Image:
     return render_panel_view(panels, draw_hours_panel)
 
 
-def render_stats(panels: list[dict]) -> bytes:
+def render_stats(panels: list[Usage]) -> bytes:
     """A still GIF (so a small upload) with both providers' activity stats."""
     return encode_gif([render_stats_frame(panels)])
 
 
-def render_breakdown(panels: list[dict]) -> bytes:
+def render_breakdown(panels: list[Usage]) -> bytes:
     return encode_gif([render_breakdown_frame(panels)])
 
 
-def render_hours(panels: list[dict]) -> bytes:
+def render_hours(panels: list[Usage]) -> bytes:
     return encode_gif([render_hours_frame(panels)])

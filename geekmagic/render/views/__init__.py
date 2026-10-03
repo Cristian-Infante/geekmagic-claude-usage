@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from geekmagic.model import ErrorScreen, Usage
 from geekmagic.render.animations import ANIMATIONS, IDLE_BOB, Rotation, animation_for, busy_animation
 from geekmagic.render.gif import encode_gif
 from geekmagic.render.views import error, panels as panel_views, single, split
@@ -33,34 +34,34 @@ class View(ABC):
 class SingleView(View):
     """One provider's screen, with its mascot playing an animation."""
 
-    def render(self, usage: dict, animation: str, rotation: Rotation) -> Rendered:
+    def render(self, usage: Usage, animation: str, rotation: Rotation) -> Rendered:
         rotating = animation in ("auto", "random")
         if rotating and busy_animation(usage):  # its agent is busy: the mascot shows it (and that isn't a rotation pick)
             animation, rotating = busy_animation(usage), False
         elif rotating:
-            animation = rotation.pick(usage.get("title", "Claude"))
+            animation = rotation.pick(usage.title)
         gif = single.render_animation(usage, animation)
-        picks = [(usage.get("title", "Claude"), animation)] if rotating else []
+        picks = [(usage.title, animation)] if rotating else []
         return Rendered(gif, [animation], picks)
 
 
 class ErrorView(View):
     """A provider that can't be read: its mascot and why."""
 
-    def render(self, usage: dict, animation: str = "idle", rotation: Rotation | None = None) -> Rendered:
-        return Rendered(encode_gif([error.render_error_frame(usage)]))
+    def render(self, screen: ErrorScreen, animation: str = "idle", rotation: Rotation | None = None) -> Rendered:
+        return Rendered(encode_gif([error.render_error_frame(screen)]))
 
 
 class SplitView(View):
     key = "split"
 
-    def render(self, panels: list[dict], animation: str, rotation: Rotation) -> Rendered:
+    def render(self, panels: list[Usage], animation: str, rotation: Rotation) -> Rendered:
         """Each provider gets a fresh animation of its own ("auto" / "random"), remembered once uploaded."""
         names = [animation_for(usage, animation, rotation) for usage in panels[:2]]
         picks = []
         if animation in ("auto", "random"):
-            picks = [(usage.get("title", "Claude"), name) for usage, name in zip(panels[:2], names)
-                     if not usage.get("working")]  # busy agent: its mascot works, which isn't a rotation pick
+            picks = [(usage.title, name) for usage, name in zip(panels[:2], names)
+                     if not usage.working]  # busy agent: its mascot works, which isn't a rotation pick
         return Rendered(split.render_split(panels, names), names, picks)
 
 
@@ -70,7 +71,7 @@ class _StillPanels(View):
     needs_activity = True
     frame = staticmethod(lambda panels: None)
 
-    def render(self, panels: list[dict], animation: str = "idle", rotation: Rotation | None = None) -> Rendered:
+    def render(self, panels: list[Usage], animation: str = "idle", rotation: Rotation | None = None) -> Rendered:
         return Rendered(encode_gif([self.frame(panels)]))
 
 

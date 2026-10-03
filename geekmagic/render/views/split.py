@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw, ImageFont
 
+from geekmagic.model import Usage
 from geekmagic.render.animations import ANIMATIONS, IDLE_BOB
 from geekmagic.render.components import (
     clock, draw_busy_tag, draw_split_row, format_delta, window_pace,
@@ -20,7 +21,7 @@ from geekmagic.render.palette import BG, HEIGHT, PILL_BG, SPLIT_PANEL_H, STATE_C
 SPLIT_ART = (64, 40)  # the mascot-and-props corner of a split panel: the same art, at the same scale, as the single screens
 
 
-def header_art(usage: dict, frame: tuple) -> Image.Image:
+def header_art(usage: Usage, frame: tuple) -> Image.Image:
     """The top-left corner of a single-provider screen for one animation frame (mascot at full size plus whatever it
     holds: laptop, mug, bolt, sparkles...). The animations draw at absolute coordinates, so draw the real thing on a
     scratch screen and cut the corner out."""
@@ -33,14 +34,14 @@ def header_art(usage: dict, frame: tuple) -> Image.Image:
     return scratch.crop((0, 0, *SPLIT_ART))
 
 
-def draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, fonts: dict) -> None:
+def draw_split_panel(image: Image.Image, top: int, usage: Usage, frame: tuple, fonts: dict) -> None:
     """One provider's panel (animated header + two rows) at vertical offset `top`; dimmed and dated if stale."""
     theme = theme_for(usage)
     draw = ImageDraw.Draw(image)
-    image.paste(header_art(usage, (0, 0, None) if usage.get("stale") else frame), (0, top))
-    draw.text((SPLIT_ART[0] + 2, top + 8), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
-    updated = clock(usage["now"])
-    if not usage.get("stale"):
+    image.paste(header_art(usage, (0, 0, None) if usage.stale else frame), (0, top))
+    draw.text((SPLIT_ART[0] + 2, top + 8), usage.title, font=fonts["title"], fill=TEXT)
+    updated = clock(usage.now)
+    if not usage.stale:
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 12), updated, font=fonts["small"], fill=theme["current"])
         draw_busy_tag(draw, top + 25, usage, fonts["small"])
@@ -49,11 +50,11 @@ def draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, fo
         (top + 77, "Weekly", "weekly", theme["weekly"]),
     ):
         draw_split_row(
-            draw, top=row_top, label=label, percent=usage[f"{window}_pct"],
-            reset_text=format_delta(usage[f"{window}_reset"], usage["now"]), accent=accent, fonts=fonts,
+            draw, top=row_top, label=label, percent=usage.window(window).pct,
+            reset_text=format_delta(usage.window(window).reset, usage.now), accent=accent, fonts=fonts,
             pace_info=window_pace(usage, window),
         )
-    if usage.get("stale"):
+    if usage.stale:
         box = (0, top, WIDTH, top + SPLIT_PANEL_H)
         image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
         text = f"! stale since {updated}"
@@ -61,7 +62,7 @@ def draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, fo
         ImageDraw.Draw(image).text((230 - width, top + 12), text, font=fonts["small"], fill=STATE_COLORS["warn"])
 
 
-def render_split_frame(panels: list[dict], animations: list[str] | None = None, index: int = 0) -> Image.Image:
+def render_split_frame(panels: list[Usage], animations: list[str] | None = None, index: int = 0) -> Image.Image:
     """Frame `index` of the split view. Each panel plays its own animation (default: just the idle bob); a shorter
     one simply loops again while a longer one is still going."""
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
@@ -77,7 +78,7 @@ def render_split_frame(panels: list[dict], animations: list[str] | None = None, 
     return image
 
 
-def render_split(panels: list[dict], animations: list[str] | None = None) -> bytes:
+def render_split(panels: list[Usage], animations: list[str] | None = None) -> bytes:
     """Looping GIF with two providers' usage stacked on one screen, each mascot doing its own animation."""
     animations = animations or []
     length = max((len(ANIMATIONS[animations[i] if i < len(animations) else "idle"]) for i in range(len(panels[:2]))),

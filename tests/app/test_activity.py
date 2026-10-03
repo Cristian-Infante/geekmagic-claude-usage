@@ -51,8 +51,8 @@ class ActivityTests(AppTestCase):
                 fake_fetchers(claude=lambda: usage(20, 5), codex=lambda: usage(10, 5, title="Codex")), capture_screen() as cap:
             self.assertEqual(app.scheduler.update_panels("stats"), "ok")
         _, (claude, codex), _ = cap.panels[0]
-        self.assertEqual(claude["activity"], ACTIVITY["claude"])
-        self.assertIsNone(codex["activity"], "no numbers yet: the screen says it's counting")
+        self.assertEqual(claude.activity, ACTIVITY["claude"])
+        self.assertIsNone(codex.activity, "no numbers yet: the screen says it's counting")
 
     def test_a_provider_without_logs_is_marked_as_having_none(self):
         app = self.make()

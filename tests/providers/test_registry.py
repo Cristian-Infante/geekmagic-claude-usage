@@ -1,8 +1,10 @@
 """The providers are interchangeable to the rest of the app: each bundles how to read, count, watch and sign in."""
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from geekmagic.insights import agent_activity, usage_stats
+from geekmagic.model import Usage, Window
 from geekmagic.providers import ALL, KEY_OF, PROVIDERS, TITLES, Provider, claude, codex
 from geekmagic.render import animations, mascots
 
@@ -37,11 +39,14 @@ class RegistryTests(unittest.TestCase):
             Incomplete()
 
     def test_reading_counting_and_watching_go_to_each_providers_own_code(self):
-        with patch.object(claude, "fetch_usage", return_value={"title": "Claude"}) as read:
-            self.assertEqual(PROVIDERS["claude"].fetch(), {"title": "Claude"})
+        def reading(title):
+            return Usage(title=title, current=Window(), weekly=Window(), now=datetime.now().astimezone())
+        claude_usage, codex_usage = reading("Claude"), reading("Codex")
+        with patch.object(claude, "fetch_usage", return_value=claude_usage) as read:
+            self.assertIs(PROVIDERS["claude"].fetch(), claude_usage)
         read.assert_called_once()
-        with patch.object(codex, "fetch_codex_usage", return_value={"title": "Codex"}):
-            self.assertEqual(PROVIDERS["codex"].fetch(), {"title": "Codex"})
+        with patch.object(codex, "fetch_codex_usage", return_value=codex_usage):
+            self.assertIs(PROVIDERS["codex"].fetch(), codex_usage)
         with patch.object(usage_stats, "claude_stats", return_value={"total": 1}) as count:
             self.assertEqual(PROVIDERS["claude"].local_stats(5.0), {"total": 1})
         count.assert_called_once_with(5.0)

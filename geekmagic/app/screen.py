@@ -14,6 +14,7 @@ from collections.abc import Callable
 from geekmagic.app import config
 from geekmagic.device import discovery, files
 from geekmagic.device.client import GeekMagicDevice, UploadCancelled
+from geekmagic.model import ErrorScreen, Usage
 from geekmagic.providers import TITLES
 from geekmagic.render import views
 from geekmagic.render.animations import Rotation
@@ -30,7 +31,7 @@ class Screen:
         self.rotation = rotation
         self.render_id = render_id  # identifies the code that draws the screens, see snapshot
         self.active_key = active_key
-        self.flag = flag  # (key, usage) -> usage with the "its agent is working" flags set
+        self.flag = flag  # (key, data) -> data with the "its agent is working" flags set
         self.notify = notify
         self.save = save
         self.set_title = set_title
@@ -115,11 +116,11 @@ class Screen:
 
     # --- what's on the device -----------------------------------------------------------------------------------
 
-    def upload(self, key: str, usage: dict) -> bool:
+    def upload(self, key: str, data: Usage | list[Usage] | ErrorScreen) -> bool:
         """Upload fresh data into the view's spare slot, then pin it if it's still the active view.
 
-        `key` is a provider (`usage` is its reading, or the error screen's data) or one of the views of two (`usage` is
-        {"panels": [...]}).
+        `key` is a provider (`data` is its Usage, or the ErrorScreen saying why it can't be read) or one of the views of
+        two (`data` is the list of the two Usage).
         """
         if time.monotonic() - self.last_click < config.SETTLE_SECONDS:
             # A click just happened. Cancelling only stops the upload in flight, and the rest of this cycle's uploads
@@ -127,7 +128,7 @@ class Screen:
             # while the click's own request waits. Stand down; the worker retries once clicking settles.
             self.wake.set()
             return False
-        usage = self.flag(key, usage)
+        data = self.flag(key, data)
         self.cancel = cancel = threading.Event()
         with self.push_lock:
             spare = "b" if self.slots.get(key) == "a" else "a"
@@ -135,11 +136,11 @@ class Screen:
             log.info("uploading %s -> %s", key, filename)
             try:
                 if key in views.PANEL_VIEWS:
-                    rendered = views.PANEL_VIEWS[key].render(usage["panels"], self.animation, self.rotation)
-                elif usage.get("error"):  # a provider that has never been read: say why instead of showing nothing
-                    rendered = views.ERROR.render(usage)
+                    rendered = views.PANEL_VIEWS[key].render(data, self.animation, self.rotation)
+                elif isinstance(data, ErrorScreen):  # a provider that has never been read: say why instead of showing nothing
+                    rendered = views.ERROR.render(data)
                 else:
-                    rendered = views.SINGLE.render(usage, self.animation, self.rotation)
+                    rendered = views.SINGLE.render(data, self.animation, self.rotation)
                 self.device.upload(rendered.gif, filename, cancel=cancel)
             except UploadCancelled:
                 log.info("upload cancelled (%s)", key)
@@ -149,8 +150,8 @@ class Screen:
                 self.rotation.record(title, name)  # now it really is on the device
             self.slots[key] = spare
             self.outdated.discard(key)
-            if key in TITLES and usage.get("error"):
-                self.error_shown[key] = usage["error"]
+            if key in TITLES and isinstance(data, ErrorScreen):
+                self.error_shown[key] = data.message
             self.save()
             self.last_upload[key] = time.monotonic()
             if key == self.active_key():  # checked after the slow upload, in case the user switched meanwhile
@@ -221,15 +222,15 @@ class Screen:
         self.offline, self.offline_since = False, None
         return True
 
-    def deliver(self, key: str, usage: dict) -> str:
-        """Upload `usage` for a view: "ok", "cancelled" (a click got in the way), "offline" or "error"."""
+    def deliver(self, key: str, data: Usage | list[Usage] | ErrorScreen) -> str:
+        """Upload `data` for a view: "ok", "cancelled" (a click got in the way), "offline" or "error"."""
         if not self.ip:
             self.mark_offline("no device address yet")
             return "offline"
         if self.offline and not self.device_is_back():
             return "offline"
         try:
-            if not self.upload(key, usage):
+            if not self.upload(key, data):
                 return "cancelled"
         except OSError as e:  # the device is off or unreachable
             self.mark_offline(e)

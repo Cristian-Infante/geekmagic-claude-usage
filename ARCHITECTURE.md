@@ -5,6 +5,7 @@ start-at-login entry runs `tray.py`).
 
 ```
 geekmagic/
+  model.py             Usage, Window, Projection, CodexExtra, ErrorScreen: what the app passes around, typed
   errors.py            UsageError, SignInNeeded
   paths.py             where the app keeps its own files
   providers/           WHAT is read: one module per AI tool, behind one interface
@@ -58,7 +59,7 @@ render  device  providers  insights   system
 | **Composition root / DI** | `app/tray_app.py` | Services get their collaborators in the constructor (callbacks for what they must tell the app), so each is testable alone. |
 | **Observer (hooks)** | `UsageService.on_read/on_failure`, `AgentMonitor.on_change` | A service reports what happened without knowing who cares. |
 | **Memento** | `app/persistence.py` | Each part has `restore(saved)` / `snapshot()`; one file remembers them all and a damaged piece only costs that part's memory. |
-| **Value object** | `render/views/Rendered` | A view returns the GIF *and* the rotation picks to remember; the caller records them only once the upload went through. |
+| **Value objects** | `model.py` (`Usage`, `Window`...), `render/views/Rendered` | A reading is a typed object, not a dict, so a misspelt field fails at once; a view returns the GIF *and* the rotation picks to remember, and the caller records them only once the upload went through. |
 
 ## Adding a provider
 

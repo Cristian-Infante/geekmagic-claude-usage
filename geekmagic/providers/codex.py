@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from geekmagic.insights import agent_activity, pace, usage_stats
+from geekmagic.model import CodexExtra, Usage, Window
 from geekmagic.providers.base import Provider
 from geekmagic.errors import SignInNeeded, UsageError
 from geekmagic.system.executables import which
@@ -122,49 +123,40 @@ def _fetch_codex_rate_limits() -> dict:
         proc.stdout.close()
 
 
-def fetch_codex_usage() -> dict:
+def fetch_codex_usage() -> Usage:
     """Fetch fresh account limits, even when the user is not actively using Codex."""
     limits = _fetch_codex_rate_limits()
     now = datetime.now().astimezone()
 
-    def window(block: dict | None) -> tuple[float | None, datetime | None]:
+    def window(block: dict | None) -> Window:
         if block is None:
-            return None, None
+            return Window()
         if not isinstance(block, dict):
             raise UsageError("Codex returned an invalid quota window.")
         try:
             reset = datetime.fromtimestamp(block["resetsAt"]).astimezone() if block.get("resetsAt") else None
-            return float(block["usedPercent"]), reset
+            pct = float(block["usedPercent"])
         except (KeyError, TypeError, ValueError, OverflowError, OSError) as e:
             raise UsageError("Codex returned an invalid quota window.") from e
+        # Codex says how long each window really is (300 and 10080 minutes at the time of writing).
+        minutes = block.get("windowDurationMins")
+        return Window(pct, reset, minutes if isinstance(minutes, (int, float)) else None)
 
-    current_pct, current_reset = window(limits.get("primary"))
-    weekly_pct, weekly_reset = window(limits.get("secondary"))
-    usage = {
-        "title": "Codex",
-        "current_pct": current_pct, "current_reset": current_reset,
-        "weekly_pct": weekly_pct, "weekly_reset": weekly_reset,
-        "now": now,
-    }
-    # Codex says how long each window really is (300 and 10080 minutes at the time of writing).
-    lengths = {w: limits[key]["windowDurationMins"] for w, key in (("current", "primary"), ("weekly", "secondary"))
-               if isinstance(limits.get(key), dict) and isinstance(limits[key].get("windowDurationMins"), (int, float))}
-    if lengths:
-        usage["window_min"] = lengths
-    usage["codex_extra"] = _codex_extra(limits)
+    usage = Usage(title="Codex", current=window(limits.get("primary")), weekly=window(limits.get("secondary")), now=now,
+                  codex_extra=_codex_extra(limits))
     return pace.annotate(usage)
 
 
-def _codex_extra(limits: dict) -> dict:
+def _codex_extra(limits: dict) -> CodexExtra:
     """The free rate-limit resets Codex has granted you, for its own screen: how many are left and in how many days
     the next one expires. Every field is optional in Codex's reply."""
     resets = limits.get("_reset_credits") if isinstance(limits.get("_reset_credits"), dict) else {}
     available = [c for c in resets.get("credits", []) if isinstance(c, dict) and c.get("status") == "available"]
     expiries = [c["expiresAt"] for c in available if isinstance(c.get("expiresAt"), (int, float))]
-    return {
-        "free_resets": resets.get("availableCount", len(available)) or 0,
-        "next_reset_expires_days": max(0, round((min(expiries) - time.time()) / 86400)) if expiries else None,
-    }
+    return CodexExtra(
+        free_resets=resets.get("availableCount", len(available)) or 0,
+        next_reset_expires_days=max(0, round((min(expiries) - time.time()) / 86400)) if expiries else None,
+    )
 
 
 class CodexProvider(Provider):
@@ -173,7 +165,7 @@ class CodexProvider(Provider):
     login_args = ("login",)
     install_hint = "Install the Codex CLI, then run `codex login`."
 
-    def fetch(self) -> dict:
+    def fetch(self) -> Usage:
         return fetch_codex_usage()
 
     def find_cli(self) -> str | None:

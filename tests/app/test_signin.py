@@ -69,7 +69,7 @@ class SignInTests(AppTestCase):
         with capture_screen():
             app.select("codex")
         self.assertIn("Install the Codex CLI", app.usage.errors["codex"])
-        self.assertFalse(app.signin.error_usage("codex")["signin"], "there is nothing to sign in to yet")
+        self.assertFalse(app.signin.error_usage("codex").signin, "there is nothing to sign in to yet")
 
     def test_no_terminal_still_leaves_a_message(self):
         self.outcome = "failed"
@@ -110,12 +110,12 @@ class SignInTests(AppTestCase):
         with capture_screen():
             app.select("codex")
         shown = app.signin.error_usage("codex")
-        self.assertTrue(shown["signin"])
-        self.assertEqual(shown["error"], app.usage.errors["codex"])
+        self.assertTrue(shown.signin)
+        self.assertEqual(shown.message, app.usage.errors["codex"])
         with capture_screen() as cap:
             app.screen.last_click = 0
             self.assertTrue(app.screen.upload("codex", shown))
-        self.assertEqual([u["title"] for u in cap.errors], ["Codex"])
+        self.assertEqual([u.title for u in cap.errors], ["Codex"])
         self.assertIsNone(app.signin.error_usage("codex"), "it already says it")
         app.usage.errors["codex"] = "something else now"
         self.assertIsNotNone(app.signin.error_usage("codex"), "a different reason is worth saying")
@@ -151,7 +151,7 @@ class SignInTests(AppTestCase):
         app.usage.last_good["claude"] = (usage(), time.monotonic())
         app.usage.errors["codex"] = "Codex is not signed in."
         panels = app.scheduler.panels(SPLIT)
-        self.assertEqual([p["title"] for p in panels], ["Claude", "Codex"])
-        self.assertIsNone(panels[1]["current_pct"])
+        self.assertEqual([p.title for p in panels], ["Claude", "Codex"])
+        self.assertIsNone(panels[1].current.pct)
         app.usage.last_good.clear()
         self.assertEqual(app.scheduler.panels(SPLIT), [], "nothing readable at all: nothing to draw")

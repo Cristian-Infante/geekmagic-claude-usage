@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw, ImageFont
 
+from geekmagic.model import ErrorScreen
 from geekmagic.render.mascots import MASCOT_TOP, draw_mascot, theme_for
 from geekmagic.render.palette import BG, HEIGHT, MUTED, STATE_COLORS, TEXT, WIDTH
 
 
-def render_error_frame(usage: dict) -> Image.Image:
+def render_error_frame(usage: ErrorScreen) -> Image.Image:
     """What a provider's screen says when it has never been read: its mascot and why (not signed in, not installed...).
     Without it a click on a provider that can't be read would change nothing at all and look broken."""
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
@@ -16,12 +17,12 @@ def render_error_frame(usage: dict) -> Image.Image:
     theme = theme_for(usage)
     mascot_w = 3 * len(theme["bitmap"][0])
     draw_mascot(image, (10, MASCOT_TOP), 3, theme)
-    draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=ImageFont.load_default(size=26), fill=TEXT)
+    draw.text((10 + mascot_w + 10, 8), usage.title, font=ImageFont.load_default(size=26), fill=TEXT)
     heading, body = ImageFont.load_default(size=17), ImageFont.load_default(size=15)
-    draw.text((10, 56), "Sign-in needed" if usage.get("signin") else "Can't read the usage", font=heading, fill=STATE_COLORS["warn"])
+    draw.text((10, 56), "Sign-in needed" if usage.signin else "Can't read the usage", font=heading, fill=STATE_COLORS["warn"])
     # the reason, word-wrapped to the screen (what a provider's own error says is meant to be read by a person)
     lines, line = [], ""
-    for word in str(usage.get("error") or "No reading yet.").split():
+    for word in (usage.message or "No reading yet.").split():
         trial = f"{line} {word}".strip()
         if draw.textlength(trial, font=body) <= WIDTH - 20:
             line = trial

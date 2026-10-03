@@ -18,7 +18,7 @@ class SplitUpdateTests(AppTestCase):
             self.assertEqual(app.scheduler.update_split(), "ok")
         (key, panels, _), = cap.panels
         self.assertEqual(key, "split")
-        self.assertEqual([p["title"] for p in panels], ["Claude", "Codex"])
+        self.assertEqual([p.title for p in panels], ["Claude", "Codex"])
         self.assertEqual(cap.uploads, ["split-usage-a.gif"])
         self.assertEqual(cap.shown, ["split-usage-a.gif"])
         self.assertEqual(app.screen.slots["split"], "a")
@@ -33,9 +33,9 @@ class SplitUpdateTests(AppTestCase):
                 fake_fetchers(claude=lambda: usage(30, 5), codex=failing(UsageError("codex not logged in"))):
             app.scheduler.update_split()
         _, (claude, codex), _ = cap.panels[0]
-        self.assertFalse(claude.get("stale"))
-        self.assertTrue(codex["stale"])
-        self.assertEqual(codex["current_pct"], 10)
+        self.assertFalse(claude.stale)
+        self.assertTrue(codex.stale)
+        self.assertEqual(codex.current.pct, 10)
 
     def test_split_update_keeps_working_with_one_provider_missing(self):
         app = self.make()
@@ -44,8 +44,8 @@ class SplitUpdateTests(AppTestCase):
                 fake_fetchers(claude=lambda: usage(30, 5), codex=failing(UsageError("codex not installed"))):
             self.assertEqual(app.scheduler.update_split(), "ok")
             _, panels, _ = cap.panels[0]
-            self.assertEqual([x["title"] for x in panels], ["Claude", "Codex"], "the one that failed keeps its panel...")
-            self.assertIsNone(panels[1]["current_pct"], "...with dashes instead of numbers")
+            self.assertEqual([x.title for x in panels], ["Claude", "Codex"], "the one that failed keeps its panel...")
+            self.assertIsNone(panels[1].current.pct, "...with dashes instead of numbers")
             app.usage.last_good.clear()
             with fake_fetchers(claude=failing(UsageError("claude not installed"))):
                 self.assertEqual(app.scheduler.update_split(), "error")  # nothing to show at all
@@ -54,7 +54,7 @@ class SplitUpdateTests(AppTestCase):
         app = self.make()
         app.view.split = True
         with capture_screen(), patch.object(GeekMagicDevice, "upload", side_effect=UploadCancelled()):
-            self.assertEqual(app.screen.deliver("split", {"panels": [usage()]}), "cancelled")
+            self.assertEqual(app.screen.deliver("split", [usage()]), "cancelled")
         self.assertNotIn("split", app.screen.slots)
 
 

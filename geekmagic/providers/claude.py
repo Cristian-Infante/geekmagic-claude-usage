@@ -9,6 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from geekmagic.insights import agent_activity, pace, usage_stats
+from geekmagic.model import Usage, Window
 from geekmagic.providers.base import Provider
 from geekmagic.errors import SignInNeeded, UsageError
 from geekmagic.system.executables import which
@@ -31,7 +32,7 @@ _RESET_RE = re.compile(
 _SIGNED_OUT_RE = re.compile(r"not logged in|/login|log ?in again|sign ?in|authenticat|invalid api key|unauthori[sz]ed|token .*expired", re.I)
 
 
-def fetch_usage() -> dict:
+def fetch_usage() -> Usage:
     """Call Claude Code's built-in /usage command. Guaranteed $0 cost."""
     try:
         proc = subprocess.run(
@@ -71,20 +72,20 @@ def fetch_usage() -> dict:
     return pace.annotate(_parse(result))
 
 
-def _parse(text: str) -> dict:
+def _parse(text: str) -> Usage:
     now = datetime.now().astimezone()
     session = _SESSION_RE.search(text)
     week = _WEEK_RE.search(text)
     if not session and not week:
         raise UsageError("Could not find usage lines in /usage output:\n" + text)
-    return {
-        "title": "Claude",
-        "current_pct": float(session.group(1)) if session else None,
-        "current_reset": _parse_reset(session.group(2), now) if session and session.group(2) else None,
-        "weekly_pct": float(week.group(1)) if week else None,
-        "weekly_reset": _parse_reset(week.group(2), now) if week and week.group(2) else None,
-        "now": now,
-    }
+    return Usage(
+        title="Claude",
+        current=Window(float(session.group(1)) if session else None,
+                       _parse_reset(session.group(2), now) if session and session.group(2) else None),
+        weekly=Window(float(week.group(1)) if week else None,
+                      _parse_reset(week.group(2), now) if week and week.group(2) else None),
+        now=now,
+    )
 
 
 def _parse_reset(text: str, now: datetime) -> datetime | None:
@@ -112,7 +113,7 @@ class ClaudeProvider(Provider):
     login_args = ("auth", "login")
     install_hint = "Install Claude Code (https://claude.ai/code), then sign in."
 
-    def fetch(self) -> dict:
+    def fetch(self) -> Usage:
         return fetch_usage()
 
     def find_cli(self) -> str | None:

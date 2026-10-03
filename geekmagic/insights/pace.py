@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from geekmagic.model import WINDOWS, Projection, Usage
+
 # Window lengths in minutes. Codex reports its own (windowDurationMins); Claude's /usage doesn't, so these apply.
 DEFAULT_WINDOW_MIN = {"current": 300, "weekly": 10080}
 MIN_ELAPSED = 0.08  # too early in a window to say anything useful (fraction of the window)
@@ -14,12 +16,11 @@ MIN_SPAN_SHARE = 0.25  # ...and at least this share of the look-back, so a short
 
 
 def project(pct: float | None, reset_at: datetime | None, now: datetime, window_min: float,
-            recent_rate: float | None = None) -> dict | None:
+            recent_rate: float | None = None) -> Projection | None:
     """Projection for one window, or None when it's too early / there's nothing to go on.
 
     The pace is the faster of your average since the window started and your recent rate (percentage points
-    per minute), so a burst of work shows up instead of being averaged away. Returns
-    {"rate", "end" (projected % at reset, may exceed 100), "hits_limit", "minutes_to_limit" (None if it won't)}.
+    per minute), so a burst of work shows up instead of being averaged away.
     """
     if pct is None or reset_at is None or pct < MIN_PCT:
         return None
@@ -30,10 +31,7 @@ def project(pct: float | None, reset_at: datetime | None, now: datetime, window_
     rate = max(pct / elapsed, recent_rate or 0.0)
     end = pct + rate * remaining
     hits = end >= 100 and pct < 100
-    return {
-        "rate": rate, "end": end, "hits_limit": hits,
-        "minutes_to_limit": (100 - pct) / rate if hits else None,
-    }
+    return Projection(rate=rate, end=end, hits_limit=hits, minutes_to_limit=(100 - pct) / rate if hits else None)
 
 
 def recent_rate(history: list, reset_epoch: float | None, now_epoch: float, lookback_min: float) -> float | None:
@@ -61,22 +59,21 @@ def format_minutes(minutes: float) -> str:
     return f"{hours}h {mins}m" if hours else f"{mins}m"
 
 
-def describe(proj: dict | None) -> tuple[str, str] | None:
+def describe(proj: Projection | None) -> tuple[str, str] | None:
     """(text, state) for the screen: "Full in 1h 30m" (crit under an hour, else warn) or "~62% at reset" (muted)."""
     if not proj:
         return None
-    if proj["hits_limit"]:
-        return f"Full in {format_minutes(proj['minutes_to_limit'])}", "crit" if proj["minutes_to_limit"] < 60 else "warn"
-    return f"~{proj['end']:.0f}% at reset", "ok"
+    if proj.hits_limit:
+        return f"Full in {format_minutes(proj.minutes_to_limit)}", "crit" if proj.minutes_to_limit < 60 else "warn"
+    return f"~{proj.end:.0f}% at reset", "ok"
 
 
-def annotate(usage: dict, recent: dict[str, float | None] | None = None) -> dict:
-    """Add usage["pace"] = {"current": projection|None, "weekly": projection|None} (in place) and return `usage`."""
+def annotate(usage: Usage, recent: dict[str, float | None] | None = None) -> Usage:
+    """Set usage.pace = {"current": projection|None, "weekly": projection|None} (in place) and return `usage`."""
     recent = recent or {}
-    windows = {**DEFAULT_WINDOW_MIN, **usage.get("window_min", {})}
-    usage["pace"] = {
-        window: project(usage.get(f"{window}_pct"), usage.get(f"{window}_reset"), usage["now"], windows[window],
-                        recent.get(window))
-        for window in ("current", "weekly")
+    usage.pace = {
+        kind: project(usage.window(kind).pct, usage.window(kind).reset, usage.now,
+                      usage.window(kind).minutes or DEFAULT_WINDOW_MIN[kind], recent.get(kind))
+        for kind in WINDOWS
     }
     return usage
