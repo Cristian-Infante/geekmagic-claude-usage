@@ -170,7 +170,7 @@ Both are counted the same way from each provider's own local log, `~/.claude`
 cached, recounted every 10 minutes (the first count of a large history takes a
 second or two). For Claude they agree with what `claude /usage` calls "Last
 24h / Last 7d". Only this machine's activity is counted. It's a still image, so
-it uploads quickly. Logic: `usage_stats.py`.
+it uploads quickly. Logic: `geekmagic/insights/usage_stats.py`.
 
 ### Projects and models, and peak hours
 
@@ -242,7 +242,7 @@ notification says which one:
   `task_complete`, and a pending approval or question request counts as waiting
   (best effort: not verified against a real approval, and not every setup records
   them). A log that goes quiet is treated as abandoned after a while. Polled every
-  2 seconds. Logic: `agent_activity.py`.
+  2 seconds. Logic: `geekmagic/insights/agent_activity.py`.
 
 ### Codex's free resets
 
@@ -265,7 +265,7 @@ the last 30 minutes (the last day for the week, and only once there's at least
 a quarter of that much history, so a short burst isn't stretched over days),
 so a burst of work shows up instead of being averaged away. Nothing is shown when it's too early in a window (under
 8 % of it) or almost nothing has been used, and never on stale numbers. Window
-lengths are 5 hours and 7 days; Codex reports its own. Logic: `pace.py`.
+lengths are 5 hours and 7 days; Codex reports its own. Logic: `geekmagic/insights/pace.py`.
 
 ### Pause
 
@@ -302,10 +302,10 @@ guessing and changing it behind your back.
   **resets**. It watches *both* providers even when only one is on screen
   (the hidden one is read every 2 minutes). Each alert fires once, also across
   restarts. Turn them off from the menu (**Notifications**); the choice is remembered.
-  Thresholds live in `alerts.py`.
+  Thresholds live in `geekmagic/insights/alerts.py`.
 - **How notifications are sent.** Each alert is shown **once**, by the tray app
   itself (the one Windows lists as "Python"). Only if that fails does the
-  system's own route (`notifier.py`: a PowerShell toast on Windows, `osascript`
+  system's own route (`geekmagic/system/notifier.py`: a PowerShell toast on Windows, `osascript`
   on macOS, `notify-send` on Linux) step in as a backup; sending both made every
   alert appear twice. The backup's text travels in environment variables, never
   inside a command. `GEEKMAGIC_NO_NOTIFY=1` turns that backup off (the tests use it).
@@ -354,7 +354,7 @@ python tray.py --uninstall-startup
 By default (`--animation auto`) every push picks a random animation from the
 provider's own set, never one of the last three that played. Pass
 `--animation NAME` to pin one instead (`random` is the same as `auto`). All of
-them live side by side in the `ANIMATIONS` dict in `geekmagic_claude.py` —
+them live side by side in the `ANIMATIONS` dict in `geekmagic/render/animations.py` —
 picking one never deletes another, and adding a new one is just a new entry.
 
 ```bash
@@ -475,35 +475,44 @@ Other platforms: use `cron`, a `systemd --user` timer, or Windows Task
 Scheduler to run `python3 geekmagic_claude.py --ip ... [--provider codex]` on a
 schedule — or just use the tray app's `--install-startup`.
 
+## Code layout
+
+The code is a package, `geekmagic/`, in layers that only depend downwards (`ARCHITECTURE.md` has the details, the
+patterns used and how to add a provider or a view):
+
+| Folder | What it is |
+|---|---|
+| `providers/` | One class per AI tool behind a common `Provider` interface: read its usage, find its CLI, count its logs, sign in. |
+| `insights/` | What the numbers mean: pace, alert thresholds, activity counted from the local logs, is an agent working. |
+| `render/` | How it looks: mascots, animations, and one class per screen (`views/`). Readings in, pictures out. |
+| `device/` | The screen on the network: `GeekMagicDevice` (upload, show, brightness), discovery, file names. |
+| `system/` | What depends on the OS: notifications, sign-in windows, lock detection, start at login. |
+| `app/` | The tray app: a small set of services (usage, screen, agents, backlight...) wired together in `tray_app.py`. |
+
+`tray.py` and `geekmagic_claude.py` at the top are launchers for `geekmagic.app` and `geekmagic.cli`.
+
 ## Tests
 
-All the tests live in [`tests/`](tests/) and need nothing but Python: no real
-device, no Claude Code or Codex login (the device, the network and the
-providers are faked).
+All the tests live in [`tests/`](tests/), in folders that mirror the package, and need nothing but Python: no real
+device, no Claude Code or Codex login (the device, the network and the providers are faked).
 
 ```bash
-python -m unittest                      # everything, from the repo root
-python -m unittest tests.test_alerts    # one file
+python -m unittest                              # everything, from the repo root
+python -m unittest tests.insights.test_alerts   # one file
+python -m unittest discover -s tests/app -t .   # one folder
 ```
 
-| File | Covers |
+| Folder | Covers |
 |---|---|
-| `test_alerts.py` | colour thresholds and when notifications fire |
-| `test_pace.py` | pace projection: where a window ends up, when it runs out |
-| `test_agent_activity.py` | deciding from the logs whether Claude / Codex is working, waiting for you or idle, per session |
-| `test_login.py` | opening a provider's sign-in per OS (quoting, terminals), and telling "signed out" from other failures |
-| `test_tray_signin.py` | picking a signed-out provider opens its sign-in once, and its screen says so |
-| `test_notifier.py` | the system-route backup per OS, and that nothing in the text can break (or inject into) the command |
-| `test_single_instance.py` | a second copy can't start while the first runs, and the lock frees up afterwards |
-| `test_response_times.py` | small-but-identical GIFs, one request to show an image, parallel reads, start-up order |
-| `test_usage_stats.py` | the same activity stats for both providers (counts, sessions, daily chart, cache), Codex's free resets |
-| `test_session_lock.py` | screen-lock detection (real here, mocked for macOS / Linux) |
-| `test_brightness.py` | brightness and night mode, against a fake device |
-| `test_codex_usage.py` | the Codex limits query (against a fake `app-server`) |
-| `test_discover.py` | finding the device on the network |
-| `test_render_states.py` | alert colours, stale dimming, 12-hour clock, split and stats views, pace on screen |
-| `test_device_errors.py` | a device that cuts responses short is treated as unreachable |
-| `test_tray_logic.py` | tray behaviour: view restore, alerts, pace history, pause and lock, brightness, stats view, rediscovery, clicks vs uploads |
+| `tests/insights/` | colour thresholds and alerts, pace projection, the activity stats counted from the logs (per provider, daily chart, cache, Codex's free resets), deciding whether an agent is working, waiting or idle |
+| `tests/providers/` | the Codex limits query (against a fake `app-server`), the registry every provider plugs into |
+| `tests/render/` | every screen (colours, stale dimming, 12-hour clock, split / stats / breakdown / hours, pace, the working and waiting tags), and small-but-identical GIFs |
+| `tests/device/` | the device client against a fake device (one request to show an image, brightness, night mode, truncated replies), and finding it on the network |
+| `tests/system/` | notifications per OS, screen-lock detection, one copy at a time, opening a provider's sign-in |
+| `tests/app/` | the tray app, one file per service: usage and alerts, the screen and its stored images, view restore, clicks vs uploads, pause and lock, backlight, agents (per session), local activity counts, sign-in, the menu, timing |
+
+`tests/support.py` has the shared harness: a tray app with the device, the network, the providers and the notifications
+faked out, and a recorder of what it renders and sends.
 
 The tray tests need a desktop session (they build the tray icon objects) and
 skip themselves without one.

@@ -14,14 +14,8 @@ import shutil
 import subprocess
 import sys
 
-import geekmagic_claude as g
+from geekmagic.providers import PROVIDERS
 
-TITLES = {"claude": "Claude", "codex": "Codex"}
-ARGS = {"claude": ["auth", "login"], "codex": ["login"]}
-INSTALL_HINTS = {
-    "claude": "Install Claude Code (https://claude.ai/code), then sign in.",
-    "codex": "Install the Codex CLI, then run `codex login`.",
-}
 LINUX_TERMINALS = (
     ("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]), ("konsole", ["-e"]),
     ("xfce4-terminal", ["-x"]), ("kitty", []), ("alacritty", ["-e"]), ("xterm", ["-e"]),
@@ -30,9 +24,7 @@ LINUX_TERMINALS = (
 
 def executable(provider: str) -> str | None:
     """Where the provider's CLI is (the usual install folders are searched too, as a login task's PATH is short)."""
-    if provider == "codex":
-        return g._find_codex()
-    return g._which("claude")
+    return PROVIDERS[provider].find_cli()
 
 
 def terminal_command(argv: list[str], title: str, platform: str | None = None) -> list[str] | str | None:
@@ -61,7 +53,7 @@ def launch(provider: str) -> str:
     path = executable(provider)
     if not path:
         return "missing"
-    command = terminal_command([path, *ARGS[provider]], f"{TITLES[provider]} sign-in")
+    command = terminal_command([path, *PROVIDERS[provider].login_args], f"{PROVIDERS[provider].title} sign-in")
     if not command:
         return "failed"
     try:

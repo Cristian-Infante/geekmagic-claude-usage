@@ -214,8 +214,6 @@ def codex_state(now_epoch: float, root: Path | None = None) -> dict:
     return _state(root or usage_stats.CODEX_DIR, _codex_summary, _codex_state, now_epoch)
 
 
-STATES = {"claude": claude_state, "codex": codex_state}
-
 
 def duration_text(seconds: float) -> str:
     """"45 s", "4 min", "1 h 05 min"."""

@@ -197,8 +197,6 @@ def codex_stats(now_epoch: float, root: Path | None = None) -> dict | None:
     return summarize(collect(root, _codex_events, now_epoch), now_epoch) if root.is_dir() else None
 
 
-STATS = {"claude": claude_stats, "codex": codex_stats}
-
 
 # --- text for the screen ------------------------------------------------------------------------------
 

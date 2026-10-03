@@ -367,9 +367,6 @@ class TextTests(unittest.TestCase):
         self.assertEqual([a.duration_text(x) for x in (0, 5, 59.6, 60, 240, 3599, 3600, 3900, -4)],
                          ["0 s", "5 s", "1 min", "1 min", "4 min", "59 min", "1 h 00 min", "1 h 05 min", "0 s"])
 
-    def test_both_providers_are_covered(self):
-        self.assertEqual(set(a.STATES), {"claude", "codex"})
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,8 @@ import logging
 import threading
 import unittest
 
-import geekmagic_claude as g
+from geekmagic.device.client import GeekMagicDevice
+from tests.support import AppTestCase, usage
 
 
 class _Truncating:
@@ -46,9 +47,9 @@ class DeviceErrorTests(unittest.TestCase):
 
     def test_truncated_responses_become_oserrors(self):
         for call in (
-            lambda: g.show_image(self.server.address, "x.gif"),
-            lambda: g.list_images(self.server.address),
-            lambda: g.delete_image(self.server.address, "x.gif"),
+            lambda: GeekMagicDevice(self.server.address).show_image("x.gif"),
+            lambda: GeekMagicDevice(self.server.address).list_images(),
+            lambda: GeekMagicDevice(self.server.address).delete_image("x.gif"),
         ):
             with self.assertRaises(OSError) as ctx:
                 call()
@@ -57,7 +58,7 @@ class DeviceErrorTests(unittest.TestCase):
     def test_an_upload_the_device_hangs_up_on_is_an_oserror_too(self):
         # here the server resets the connection (an OSError already) or cuts the reply (wrapped): either way
         with self.assertRaises(OSError):
-            g.upload(self.server.address, b"GIF89a", "x.gif", show=False)
+            GeekMagicDevice(self.server.address).upload(b"GIF89a", "x.gif")
 
     def test_the_underlying_error_really_is_not_an_oserror(self):
         # why the wrapper exists: without it this slips past `except OSError`
@@ -65,19 +66,18 @@ class DeviceErrorTests(unittest.TestCase):
             import urllib.request
             urllib.request.urlopen(f"http://{self.server.address}/x", timeout=2).read()
 
+
+class TrayDeviceErrorTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.server = _Truncating()
+        self.addCleanup(self.server.close)
+
     def test_the_tray_treats_it_as_the_device_being_unreachable(self):
-        try:
-            import tray
-        except Exception as e:
-            self.skipTest(f"tray can't be imported here: {e}")
-        app = tray.App(self.server.address, 30, "idle")
-        self.keep_alive = app  # pystray registers a Windows window class per icon: don't let it be recycled
-        outcome = app._deliver("claude", {
-            "title": "Claude", "current_pct": 1.0, "current_reset": None, "weekly_pct": 1.0,
-            "weekly_reset": None, "now": g.datetime.now().astimezone(),
-        })
+        app = self.make(ip=self.server.address)
+        outcome = app.screen.deliver("claude", usage(1.0, 1.0))
         self.assertEqual(outcome, "offline")
-        self.assertTrue(app.offline)
+        self.assertTrue(app.screen.offline)
 
 
 if __name__ == "__main__":

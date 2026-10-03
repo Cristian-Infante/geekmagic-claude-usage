@@ -3,9 +3,11 @@ import json
 import os
 import subprocess
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import geekmagic_claude as g
+from geekmagic.providers import PROVIDERS, claude, codex
+from geekmagic.render.views import error as error_view
+from geekmagic.errors import SignInNeeded, UsageError
 from geekmagic.system import login
 
 
@@ -45,9 +47,10 @@ class LaunchTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_each_provider_signs_in_with_its_own_command(self):
-        self.assertEqual(login.ARGS, {"claude": ["auth", "login"], "codex": ["login"]})
-        self.assertEqual(set(login.ARGS), set(login.TITLES))
-        self.assertEqual(set(login.INSTALL_HINTS), set(login.TITLES))
+        self.assertEqual({key: provider.login_args for key, provider in PROVIDERS.items()},
+                         {"claude": ("auth", "login"), "codex": ("login",)})
+        for provider in PROVIDERS.values():
+            self.assertTrue(provider.install_hint, f"{provider.key} says how to install its CLI")
 
     def test_the_kill_switch_opens_nothing(self):
         with patch.dict(os.environ, {"GEEKMAGIC_NO_LOGIN": "1"}), patch.object(login.subprocess, "Popen") as popen:
@@ -76,40 +79,39 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(login.launch("claude"), "failed")
 
     def test_codex_is_looked_for_where_the_usage_query_looks(self):
-        with patch.object(g, "_find_codex", return_value="/ext/codex"):
+        with patch.object(codex, "find_codex", return_value="/ext/codex"):
             self.assertEqual(login.executable("codex"), "/ext/codex")
-        with patch.object(g, "_which", side_effect=lambda name: f"/bin/{name}"):
+        with patch.object(claude, "which", side_effect=lambda name: f"/bin/{name}"):
             self.assertEqual(login.executable("claude"), "/bin/claude")
 
 
 class SignedOutDetectionTests(unittest.TestCase):
     def run_claude(self, stdout="", stderr="", returncode=0):
         done = subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
-        with patch.object(g.subprocess, "run", return_value=done):
-            return g.fetch_usage()
+        with patch.object(claude.subprocess, "run", return_value=done):
+            return claude.fetch_usage()
 
     def test_claude_signed_out_is_told_apart_from_other_failures(self):
         for text in ("Not logged in · Please run /login", "Invalid API key · Please run /login", "authentication_error"):
-            with self.assertRaises(g.SignInNeeded, msg=text):
+            with self.assertRaises(SignInNeeded, msg=text):
                 self.run_claude(stderr=text, returncode=1)
-            with self.assertRaises(g.SignInNeeded, msg=text):
+            with self.assertRaises(SignInNeeded, msg=text):
                 self.run_claude(stdout=json.dumps({"is_error": True, "result": text, "total_cost_usd": 0}))
-        with self.assertRaises(g.UsageError) as caught:
+        with self.assertRaises(UsageError) as caught:
             self.run_claude(stderr="segmentation fault", returncode=139)
-        self.assertNotIsInstance(caught.exception, g.SignInNeeded)
-        with self.assertRaises(g.UsageError) as caught:
+        self.assertNotIsInstance(caught.exception, SignInNeeded)
+        with self.assertRaises(UsageError) as caught:
             self.run_claude(stdout=json.dumps({"is_error": True, "result": "something odd", "total_cost_usd": 0}))
-        self.assertNotIsInstance(caught.exception, g.SignInNeeded)
+        self.assertNotIsInstance(caught.exception, SignInNeeded)
 
     def test_the_error_screen_asks_for_the_sign_in(self):
         from datetime import datetime
         usage = {"title": "Codex", "error": "Codex could not read account limits. Not signed in?",
                  "now": datetime.now().astimezone()}
-        plain = g._render_error_frame(usage)
-        asking = g._render_error_frame({**usage, "signin": True})
+        plain = error_view.render_error_frame(usage)
+        asking = error_view.render_error_frame({**usage, "signin": True})
         self.assertEqual(plain.size, (240, 240))
         self.assertNotEqual(plain.tobytes(), asking.tobytes(), "the heading says what to do")
-        self.assertTrue(g.render_animation, "the GIF route exists")
 
 
 if __name__ == "__main__":

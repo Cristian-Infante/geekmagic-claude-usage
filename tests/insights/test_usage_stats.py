@@ -8,7 +8,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import geekmagic_claude as g
+from geekmagic.providers import codex
+from geekmagic.render import components
+from geekmagic.render import mascots
+from geekmagic.render import palette
 from geekmagic.insights import usage_stats as s
 
 
@@ -143,9 +146,6 @@ class SameShapeTests(LogFixture):
         stats = s.codex_stats(time.time(), self.root)
         self.assertEqual(stats["24h"], {"requests": 0, "sessions": 0})
         self.assertEqual([d["requests"] for d in stats["days"]], [0] * 7)
-
-    def test_stats_lookup_has_both_providers(self):
-        self.assertEqual(set(s.STATS), {"claude", "codex"})
 
 
 class CacheTests(LogFixture):
@@ -312,7 +312,7 @@ class TextTests(unittest.TestCase):
 
 class CodexResetsTests(unittest.TestCase):
     def extra(self, count=3, days=12, status="available"):
-        return g._codex_extra({"_reset_credits": {"availableCount": count, "credits": [
+        return codex._codex_extra({"_reset_credits": {"availableCount": count, "credits": [
             {"status": status, "expiresAt": time.time() + days * 86400},
             {"status": "available", "expiresAt": time.time() + (days + 30) * 86400},
         ]}})
@@ -325,23 +325,23 @@ class CodexResetsTests(unittest.TestCase):
         self.assertEqual(self.extra(days=1, status="used")["next_reset_expires_days"], 31)
 
     def test_missing_fields_are_fine(self):
-        self.assertEqual(g._codex_extra({}), {"free_resets": 0, "next_reset_expires_days": None})
-        self.assertEqual(g._codex_extra({"_reset_credits": "garbage"}), {"free_resets": 0, "next_reset_expires_days": None})
+        self.assertEqual(codex._codex_extra({}), {"free_resets": 0, "next_reset_expires_days": None})
+        self.assertEqual(codex._codex_extra({"_reset_credits": "garbage"}), {"free_resets": 0, "next_reset_expires_days": None})
 
     def chip(self, **codex_extra):
-        return g._resets_chip({"title": "Codex", "codex_extra": codex_extra})
+        return components.resets_chip({"title": "Codex", "codex_extra": codex_extra})
 
     def test_chip_text_and_urgency(self):
-        self.assertEqual(self.chip(free_resets=3, next_reset_expires_days=12), ("3 resets · 12d", g.THEMES["Codex"]["weekly"]))
-        self.assertEqual(self.chip(free_resets=1, next_reset_expires_days=3), ("1 reset · 3d", g.STATE_COLORS["warn"]))
-        self.assertEqual(self.chip(free_resets=2, next_reset_expires_days=1), ("2 resets · 1d", g.STATE_COLORS["crit"]))
-        self.assertEqual(self.chip(free_resets=2, next_reset_expires_days=0)[1], g.STATE_COLORS["crit"])
+        self.assertEqual(self.chip(free_resets=3, next_reset_expires_days=12), ("3 resets · 12d", mascots.THEMES["Codex"]["weekly"]))
+        self.assertEqual(self.chip(free_resets=1, next_reset_expires_days=3), ("1 reset · 3d", palette.STATE_COLORS["warn"]))
+        self.assertEqual(self.chip(free_resets=2, next_reset_expires_days=1), ("2 resets · 1d", palette.STATE_COLORS["crit"]))
+        self.assertEqual(self.chip(free_resets=2, next_reset_expires_days=0)[1], palette.STATE_COLORS["crit"])
         self.assertEqual(self.chip(free_resets=2, next_reset_expires_days=None)[0], "2 resets")
 
     def test_no_chip_without_resets_or_for_claude(self):
         self.assertIsNone(self.chip(free_resets=0, next_reset_expires_days=None))
-        self.assertIsNone(g._resets_chip({"title": "Codex"}))
-        self.assertIsNone(g._resets_chip({"title": "Claude", "codex_extra": {"free_resets": 3}}))
+        self.assertIsNone(components.resets_chip({"title": "Codex"}))
+        self.assertIsNone(components.resets_chip({"title": "Claude", "codex_extra": {"free_resets": 3}}))
 
 
 if __name__ == "__main__":

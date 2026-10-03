@@ -8,7 +8,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-import geekmagic_claude as g
+from geekmagic.providers import codex
+from geekmagic.system import executables
+from geekmagic.render.views import single
+from geekmagic.errors import SignInNeeded, UsageError
 
 
 class CodexUsageTests(unittest.TestCase):
@@ -47,10 +50,10 @@ assert sys.stdin.read() == ""  # No threads, prompts, or model turns were sent.
                 return proc
 
             try:
-                with patch.object(g.shutil, "which", return_value="fake-codex"), \
-                        patch.object(g.subprocess, "Popen", side_effect=launch), \
-                        patch.object(g, "CODEX_TIMEOUT", timeout):
-                    return g.fetch_codex_usage()
+                with patch.object(executables.shutil, "which", return_value="fake-codex"), \
+                        patch.object(codex.subprocess, "Popen", side_effect=launch), \
+                        patch.object(codex, "CODEX_TIMEOUT", timeout):
+                    return codex.fetch_codex_usage()
             finally:
                 for proc in processes:
                     self.assertIsNotNone(proc.poll(), "App-server child must be reaped")
@@ -69,35 +72,35 @@ assert sys.stdin.read() == ""  # No threads, prompts, or model turns were sent.
             self.assertEqual(result["current_pct"], percent)
             self.assertEqual(result["weekly_pct"], 42)
             self.assertEqual(result["current_reset"].timestamp(), 1900000000)
-            self.assertTrue(g.render_animation(result).startswith(b"GIF"))
+            self.assertTrue(single.render_animation(result).startswith(b"GIF"))
 
     def test_secondary_only_and_server_percent_at_past_reset(self):
         result = self.query({"rateLimits": {"secondary": {"usedPercent": 17, "resetsAt": 1700000000}}})
         self.assertIsNone(result["current_pct"])
         self.assertEqual(result["weekly_pct"], 17)  # Do not invent a 0% reading.
-        self.assertTrue(g.render_animation(result).startswith(b"GIF"))
+        self.assertTrue(single.render_animation(result).startswith(b"GIF"))
 
     def test_missing_cli(self):
-        with patch.object(g, "_find_codex", return_value=None):
-            with self.assertRaisesRegex(g.UsageError, "not found"):
-                g.fetch_codex_usage()
+        with patch.object(codex, "find_codex", return_value=None):
+            with self.assertRaisesRegex(UsageError, "not found"):
+                codex.fetch_codex_usage()
 
     def test_auth_failure_and_no_limits(self):
-        with self.assertRaisesRegex(g.SignInNeeded, "codex login"):  # being signed out is what signing in again fixes
+        with self.assertRaisesRegex(SignInNeeded, "codex login"):  # being signed out is what signing in again fixes
             self.query(mode="error")
-        with self.assertRaisesRegex(g.SignInNeeded, "no account limits"):
+        with self.assertRaisesRegex(SignInNeeded, "no account limits"):
             self.query({"rateLimits": None})
 
     def test_child_exit_and_timeout(self):
-        with self.assertRaisesRegex(g.UsageError, "exited"):
+        with self.assertRaisesRegex(UsageError, "exited"):
             self.query(mode="exit")
         start = time.monotonic()
-        with self.assertRaisesRegex(g.UsageError, "Timed out"):
+        with self.assertRaisesRegex(UsageError, "Timed out"):
             self.query(mode="timeout", timeout=0.25)
         self.assertLess(time.monotonic() - start, 5)
 
     def test_invalid_window(self):
-        with self.assertRaisesRegex(g.UsageError, "invalid quota window"):
+        with self.assertRaisesRegex(UsageError, "invalid quota window"):
             self.query({"rateLimits": {"primary": {"resetsAt": 1900000000}}})
 
 
