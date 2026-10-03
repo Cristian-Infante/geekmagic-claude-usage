@@ -20,7 +20,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-import usage_stats
+from geekmagic.insights import usage_stats
 
 SCAN_AGE = 3 * 3600  # logs older than this can't belong to a turn that is still being worked on or waited for
 TURN_MAX_AGE = 120  # seconds of silence after which a turn that isn't running a tool counts as abandoned

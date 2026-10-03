@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import single_instance
+from geekmagic.system import single_instance
 
 
 class SingleInstanceTests(unittest.TestCase):

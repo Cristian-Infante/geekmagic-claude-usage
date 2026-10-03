@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import agent_activity as a
+from geekmagic.insights import agent_activity as a
 
 IDLE = {"working": False, "waiting": False, "waiting_for": None, "since": None, "last": None, "project": None,
         "sessions": []}

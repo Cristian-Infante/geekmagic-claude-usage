@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from geekmagic.paths import TRAY_SCRIPT
+
 TASK_NAME = "GeekMagicClaude"  # Windows scheduled task
 LABEL = "com.geekmagic.claude-usage"  # macOS LaunchAgent label
 DESKTOP_FILE = "geekmagic-claude-usage.desktop"  # Linux autostart entry
@@ -114,7 +116,7 @@ def _uninstall_linux() -> str:
 
 
 def install(tray_args: list[str]) -> str:
-    script = Path(__file__).with_name("tray.py").resolve()
+    script = TRAY_SCRIPT
     command, workdir = _command(script, tray_args), script.parent
     if sys.platform == "win32":
         return _install_windows(command, workdir)

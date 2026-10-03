@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import geekmagic_claude as g
-import login
+from geekmagic.system import login
 
 
 class TerminalCommandTests(unittest.TestCase):

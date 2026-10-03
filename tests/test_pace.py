@@ -2,7 +2,7 @@
 import unittest
 from datetime import datetime, timedelta
 
-import pace
+from geekmagic.insights import pace
 
 NOW = datetime(2026, 10, 2, 14, 57).astimezone()
 

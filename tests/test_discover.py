@@ -4,7 +4,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import discover
+from geekmagic.device import discovery
 
 
 def serve(body: bytes, content_type: str = "application/json"):
@@ -40,24 +40,24 @@ class DiscoverTests(unittest.TestCase):
 
     def test_probe_accepts_a_smalltv_style_space_json(self):
         host = self.fake(json.dumps({"total": 3121152, "free": 1015308}).encode())
-        self.assertTrue(discover.probe(host, 2))
+        self.assertTrue(discovery.probe(host, 2))
 
     def test_probe_rejects_other_servers(self):
-        self.assertFalse(discover.probe(self.fake(b"<html>router login</html>", "text/html"), 2))
-        self.assertFalse(discover.probe(self.fake(json.dumps({"hello": "world"}).encode()), 2))
-        self.assertFalse(discover.probe("127.0.0.1:1", 0.5))  # nothing listening
+        self.assertFalse(discovery.probe(self.fake(b"<html>router login</html>", "text/html"), 2))
+        self.assertFalse(discovery.probe(self.fake(json.dumps({"hello": "world"}).encode()), 2))
+        self.assertFalse(discovery.probe("127.0.0.1:1", 0.5))  # nothing listening
 
     def test_scan_returns_only_the_devices(self):
         device = self.fake(json.dumps({"total": 1, "free": 1}).encode())
         router = self.fake(b"<html></html>", "text/html")
-        self.assertEqual(discover.scan([router, "127.0.0.1:1", device], timeout=2), [device])
-        self.assertEqual(discover.scan([router, "127.0.0.1:1"], timeout=0.5), [])
+        self.assertEqual(discovery.scan([router, "127.0.0.1:1", device], timeout=2), [device])
+        self.assertEqual(discovery.scan([router, "127.0.0.1:1"], timeout=0.5), [])
 
     def test_local_networks_are_private_prefixes(self):
-        for prefix in discover.local_networks():
+        for prefix in discovery.local_networks():
             self.assertRegex(prefix, r"^\d+\.\d+\.\d+\.$")
             self.assertTrue(prefix.startswith(("10.", "192.168.", "172.")))
-        self.assertLessEqual(len(discover.local_networks()), discover.MAX_NETWORKS)
+        self.assertLessEqual(len(discovery.local_networks()), discovery.MAX_NETWORKS)
 
 
 if __name__ == "__main__":

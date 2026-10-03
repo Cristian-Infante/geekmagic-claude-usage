@@ -32,17 +32,18 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-import agent_activity
-import alerts
-import autostart
-import discover
+from geekmagic.insights import agent_activity
+from geekmagic.insights import alerts
+from geekmagic.system import autostart
+from geekmagic.device import discovery
 import geekmagic_claude as g
-import login
-import notifier
-import pace
-import session_lock
-import single_instance
-import usage_stats
+from geekmagic import paths
+from geekmagic.system import login
+from geekmagic.system import notifier
+from geekmagic.insights import pace
+from geekmagic.system import session_lock
+from geekmagic.system import single_instance
+from geekmagic.insights import usage_stats
 
 # Identifies the code that draws the screens. The device keeps the images it was sent, so after an update (new
 # labels, colours, animations...) what's stored is out of date; a changed id makes the app re-upload every view once.
@@ -50,10 +51,10 @@ RENDER_ID = hashlib.sha1(b"".join(
     Path(module.__file__).read_bytes() for module in (g, pace, alerts, usage_stats, agent_activity)
 )).hexdigest()[:12]
 
-LOG_PATH = Path(__file__).with_name("tray.log")
-LOCK_PATH = Path(__file__).with_name("tray.lock")  # held by the running app, see single_instance
+LOG_PATH = paths.LOG_PATH
+LOCK_PATH = paths.LOCK_PATH  # held by the running app, see single_instance
 _instance_lock = None
-STATE_PATH = Path(__file__).with_name("tray_state.json")  # remembered between runs, see App._load_state
+STATE_PATH = paths.STATE_PATH  # remembered between runs, see App._load_state
 log = logging.getLogger("tray")
 
 
@@ -361,12 +362,12 @@ class App:
     def _resolve_device(self) -> None:
         """At startup: use --ip or the remembered address if it answers, otherwise look for the device."""
         for candidate in dict.fromkeys(filter(None, (self.ip, self.saved_ip))):
-            if discover.probe(candidate, 2.0):
+            if discovery.probe(candidate, 2.0):
                 self.ip = candidate
                 return
         self.icon.title = "GeekMagic: buscando la pantalla en la red..."
         self.last_scan = time.monotonic()
-        found = discover.find_device(prefer=self.ip or None)
+        found = discovery.find_device(prefer=self.ip or None)
         if found:
             self._set_ip(found, announce=True)
         else:
@@ -383,7 +384,7 @@ class App:
         if not due:
             return
         self.last_scan = now
-        found = discover.find_device(prefer=self.ip or None)
+        found = discovery.find_device(prefer=self.ip or None)
         if found and found != self.ip:
             self._set_ip(found, announce=True)
 
@@ -800,7 +801,7 @@ class App:
             with self.push_lock:
                 if slot:
                     g.show_image(self.ip, slot_file(key, slot))
-                elif not discover.probe(self.ip, 2.0):
+                elif not discovery.probe(self.ip, 2.0):
                     raise OSError("no answer")
         except OSError as e:
             self._mark_offline(e)

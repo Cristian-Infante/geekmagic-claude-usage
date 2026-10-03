@@ -36,9 +36,9 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
-import alerts
-import pace
-import usage_stats
+from geekmagic.insights import alerts
+from geekmagic.insights import pace
+from geekmagic.insights import usage_stats
 
 WIDTH = HEIGHT = 240
 IMAGE_NAME = "claude-usage.gif"
@@ -1499,8 +1499,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.discover or not args.ip:
-        import discover
-        found = discover.scan()
+        from geekmagic.device import discovery
+        found = discovery.scan()
         if args.discover:
             print("\n".join(found) if found else "No GeekMagic device found on this network.")
             return 0 if found else 1

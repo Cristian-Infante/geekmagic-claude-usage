@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import MagicMock, patch
 
-import notifier
+from geekmagic.system import notifier
 
 NASTY = ['He said "hi"', "it's", "line one\nline two", "back`tick $env:PATH", "'; Remove-Item -Recurse C:\\ ; '", "<b>&amp;</b>",
          "a" * 2000, "emoji 🔔 and ñ ü"]

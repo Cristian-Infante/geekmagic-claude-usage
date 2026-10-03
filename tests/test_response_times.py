@@ -320,7 +320,7 @@ class StartupOrderTests(unittest.TestCase):
             ParallelReadTests._alive.append(app)
             app.stop.set()  # only the start-up part
             with patch.object(g, "show_image", side_effect=lambda ip, name: order.append("show")), \
-                    patch.object(tray.discover, "probe", side_effect=lambda *a, **k: order.append("search") or True), \
+                    patch.object(tray.discovery, "probe", side_effect=lambda *a, **k: order.append("search") or True), \
                     patch.object(g, "list_images", side_effect=lambda ip: order.append("files") or {"claude-usage-a.gif"}):
                 app.worker()
         self.assertEqual(order[:3], ["show", "search", "files"])
@@ -347,7 +347,7 @@ class StartupOrderTests(unittest.TestCase):
             app = tray.App(None, 30, "idle")
             ParallelReadTests._alive.append(app)
             app.stop.set()
-            with patch.object(g, "show_image", side_effect=flaky), patch.object(tray.discover, "probe", return_value=True), \
+            with patch.object(g, "show_image", side_effect=flaky), patch.object(tray.discovery, "probe", return_value=True), \
                     patch.object(g, "list_images", return_value={"claude-usage-a.gif"}):
                 app.worker()
         self.assertEqual(len(attempts), 2)

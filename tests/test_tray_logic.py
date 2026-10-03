@@ -14,7 +14,7 @@ try:
 except Exception as e:  # pystray needs a desktop session
     raise unittest.SkipTest(f"tray can't be imported here: {e}")
 
-import discover
+from geekmagic.device import discovery
 import geekmagic_claude as g
 
 
@@ -163,7 +163,7 @@ class TrayLogicTests(unittest.TestCase):
     def test_rediscovers_a_device_that_moved_to_another_ip(self):
         app = self.make("192.168.1.50")
         app.offline, app.offline_since = True, time.monotonic() - tray.REDISCOVER_AFTER - 1
-        with patch.object(discover, "find_device", return_value="192.168.1.20") as find:
+        with patch.object(discovery, "find_device", return_value="192.168.1.20") as find:
             app._maybe_rediscover()
             find.assert_called_once_with(prefer="192.168.1.50")
         self.assertEqual(app.ip, "192.168.1.20")
@@ -173,7 +173,7 @@ class TrayLogicTests(unittest.TestCase):
     def test_doesnt_scan_right_away_or_too_often(self):
         app = self.make("192.168.1.50")
         app.offline, app.offline_since = True, time.monotonic() - 5  # just went offline
-        with patch.object(discover, "find_device", return_value=None) as find:
+        with patch.object(discovery, "find_device", return_value=None) as find:
             app._maybe_rediscover()
             app.offline_since = time.monotonic() - tray.REDISCOVER_AFTER - 1
             app._maybe_rediscover()  # due: scans
@@ -183,7 +183,7 @@ class TrayLogicTests(unittest.TestCase):
     def test_keeps_the_address_when_the_device_is_still_there(self):
         app = self.make("192.168.1.50")
         app.offline, app.offline_since = True, time.monotonic() - 1000
-        with patch.object(discover, "find_device", return_value="192.168.1.50"):
+        with patch.object(discovery, "find_device", return_value="192.168.1.50"):
             app._maybe_rediscover()
         self.assertEqual(app.ip, "192.168.1.50")
         self.assertEqual(self.notes, [])
@@ -191,26 +191,26 @@ class TrayLogicTests(unittest.TestCase):
     def test_no_address_at_all_scans_until_it_finds_the_device(self):
         app = self.make(None)
         self.assertEqual(app.ip, "")
-        with patch.object(discover, "find_device", return_value=None):
+        with patch.object(discovery, "find_device", return_value=None):
             app._maybe_rediscover()
         self.assertEqual(app.ip, "")
         app.last_scan = time.monotonic() - tray.DISCOVER_RETRY - 1
-        with patch.object(discover, "find_device", return_value="192.168.1.20"):
+        with patch.object(discovery, "find_device", return_value="192.168.1.20"):
             app._maybe_rediscover()
         self.assertEqual(app.ip, "192.168.1.20")
 
     def test_startup_prefers_given_ip_then_remembered_then_scans(self):
         (self.tmp / "state.json").write_text('{"ip": "192.168.1.99"}')
-        with patch.object(discover, "probe", side_effect=lambda ip, t=0: ip == "192.168.1.50"):
+        with patch.object(discovery, "probe", side_effect=lambda ip, t=0: ip == "192.168.1.50"):
             app = self.make("192.168.1.50")
             app._resolve_device()
             self.assertEqual(app.ip, "192.168.1.50")
-        with patch.object(discover, "probe", side_effect=lambda ip, t=0: ip == "192.168.1.99"):
+        with patch.object(discovery, "probe", side_effect=lambda ip, t=0: ip == "192.168.1.99"):
             app = self.make("192.168.1.50")  # --ip is dead, but the remembered address answers
             app._resolve_device()
             self.assertEqual(app.ip, "192.168.1.99")
-        with patch.object(discover, "probe", return_value=False), \
-                patch.object(discover, "find_device", return_value="192.168.1.20"):
+        with patch.object(discovery, "probe", return_value=False), \
+                patch.object(discovery, "find_device", return_value="192.168.1.20"):
             app = self.make("192.168.1.50")
             app._resolve_device()
             self.assertEqual(app.ip, "192.168.1.20")
@@ -361,7 +361,7 @@ class TrayLogicTests(unittest.TestCase):
             app = self.make()
             app.stop.set()  # run just the start-up part of the worker
             shown = []
-            with patch.object(discover, "probe", return_value=True), \
+            with patch.object(discovery, "probe", return_value=True), \
                     patch.object(g, "list_images", return_value={"claude-usage-a.gif", "codex-usage-b.gif", "split-usage-b.gif"}), \
                     patch.object(g, "show_image", side_effect=lambda ip, name: shown.append(name)):
                 app.worker()
@@ -479,7 +479,7 @@ class TrayLogicTests(unittest.TestCase):
 
     def run_worker_briefly(self, app, seconds=0.4):
         thread = threading.Thread(target=app.worker, daemon=True)
-        with patch.object(tray, "PAUSE_POLL", 0.05), patch.object(discover, "probe", return_value=True), \
+        with patch.object(tray, "PAUSE_POLL", 0.05), patch.object(discovery, "probe", return_value=True), \
                 patch.object(g, "push_usage"), patch.object(g, "push_split"), patch.object(g, "show_image"):
             thread.start()
             time.sleep(seconds)

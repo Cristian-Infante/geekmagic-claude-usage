@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import geekmagic_claude as g
-import usage_stats as s
+from geekmagic.insights import usage_stats as s
 
 
 def stamp(when: datetime) -> str:

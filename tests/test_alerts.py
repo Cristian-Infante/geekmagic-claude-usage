@@ -1,7 +1,7 @@
 """Thresholds: bar colour states and when notifications fire."""
 import unittest
 
-import alerts
+from geekmagic.insights import alerts
 
 
 class BarStateTests(unittest.TestCase):

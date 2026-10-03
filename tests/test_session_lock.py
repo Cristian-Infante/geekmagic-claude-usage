@@ -5,7 +5,7 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-import session_lock
+from geekmagic.system import session_lock
 
 
 class IsLockedTests(unittest.TestCase):

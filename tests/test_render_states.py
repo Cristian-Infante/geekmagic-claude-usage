@@ -195,7 +195,7 @@ class PaceRenderTests(unittest.TestCase):
     PACE_BOX = (120, 104, 230, 126)  # right of the "Session" reset countdown
 
     def paced(self, current, left_min, **extra):
-        import pace
+        from geekmagic.insights import pace
         now = datetime.now().astimezone().replace(hour=14, minute=57, second=0, microsecond=0)
         u = {"title": "Claude", "current_pct": current, "current_reset": now + timedelta(minutes=left_min),
              "weekly_pct": 10.0, "weekly_reset": now + timedelta(days=5), "now": now, **extra}
@@ -438,7 +438,7 @@ class BreakdownViewTests(unittest.TestCase):
 
 
 def usage_stats_shares(activity):
-    import usage_stats
+    from geekmagic.insights import usage_stats
     return usage_stats.shares(activity["projects"], activity["total"], 3)
 
 
@@ -459,7 +459,7 @@ class HoursViewTests(unittest.TestCase):
         self.assertTrue(has_colour(frame, g.THEMES["Codex"]["body"], (12, 168, 228, 226)))
 
     def test_the_caption_names_the_busiest_stretch(self):
-        import usage_stats
+        from geekmagic.insights import usage_stats
         window = usage_stats.busiest_hours(sample_activity()["hours"])
         self.assertEqual(usage_stats.hours_text(window), "12-2 PM")
         frame = g._render_hours_frame(self.panels())
