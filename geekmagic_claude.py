@@ -15,20 +15,29 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import os
+import queue
 import re
+import shutil
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = HEIGHT = 240
 IMAGE_NAME = "claude-usage.gif"
+IMAGE_NAMES = {"claude": IMAGE_NAME, "codex": "codex-usage.gif"}  # one file per provider, so switching is just /set?img
 _OLD_IMAGE_NAMES = ("claude-usage.jpg",)  # cleaned up on first run after the GIF switch
 
 # Claude's own palette (warm ink + a vivid, saturated orange), laid out
@@ -44,7 +53,7 @@ ACCENT = CURRENT_ACCENT  # used by the mascot's body
 _SESSION_RE = re.compile(r"^Current session:\s*(\d+(?:\.\d+)?)% used(?:\s*·\s*resets\s+(.+))?$", re.MULTILINE)
 _WEEK_RE = re.compile(r"^Current week(?:\s*\([^)]*\))?:\s*(\d+(?:\.\d+)?)% used(?:\s*·\s*resets\s+(.+))?$", re.MULTILINE)
 _RESET_RE = re.compile(
-    r"(?P<month>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+at\s+"
+    r"(?P<month>[A-Za-z]{3})\s+(?P<day>\d{1,2})(?:,|\s+at)\s+"
     r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?P<meridiem>am|pm)\s+\((?P<tz>[^)]+)\)",
     re.IGNORECASE,
 )
@@ -59,7 +68,7 @@ def fetch_usage() -> dict:
     try:
         proc = subprocess.run(
             [
-                "claude", "-p", "--safe-mode",
+                _which("claude") or "claude", "-p", "--safe-mode",
                 "--output-format", "json",
                 "--max-budget-usd", "0.000001",
                 "--tools", "",
@@ -67,7 +76,8 @@ def fetch_usage() -> dict:
                 "--no-chrome",
                 "/usage",
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError as e:
         raise UsageError("`claude` CLI not found in PATH. Install/open Claude Code first.") from e
@@ -89,6 +99,146 @@ def fetch_usage() -> dict:
     return _parse(result)
 
 
+CODEX_TIMEOUT = 30
+
+
+def _which(name: str) -> str | None:
+    """Like shutil.which, plus the usual install folders a background job (launchd, Task Scheduler) may not have on PATH."""
+    extra = [str(Path.home() / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    return shutil.which(name) or shutil.which(name, path=os.pathsep.join(extra))
+
+
+def _find_codex() -> str | None:
+    """`codex` from PATH, else the newest copy bundled with a VS Code-family ChatGPT/Codex extension."""
+    found = _which("codex")
+    if found:
+        return found
+    binary = "codex.exe" if sys.platform == "win32" else "codex"
+    bundled = [
+        p
+        for editor in (".vscode", ".vscode-insiders", ".cursor")
+        for p in (Path.home() / editor / "extensions").glob(f"openai.chatgpt-*/bin/*/{binary}")
+    ]
+    bundled.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(bundled[0]) if bundled else None
+
+
+def _fetch_codex_rate_limits() -> dict:
+    """Query the authenticated Codex app-server without starting an AI turn."""
+    executable = _find_codex()
+    if not executable:
+        raise UsageError("`codex` CLI not found in PATH. Install Codex CLI and run `codex login`.")
+    try:
+        proc = subprocess.Popen(
+            [executable, "app-server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as e:
+        raise UsageError("Could not start `codex app-server`.") from e
+
+    responses = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            for line in proc.stdout:
+                responses.put(line)
+        finally:
+            responses.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + CODEX_TIMEOUT
+
+    def send(message: dict) -> None:
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+    def receive(request_id: int) -> dict:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UsageError("Timed out querying Codex limits. Check your connection and `codex login`.")
+            try:
+                line = responses.get(timeout=remaining)
+            except queue.Empty as e:
+                raise UsageError("Timed out querying Codex limits. Check your connection and `codex login`.") from e
+            if line is None:
+                raise UsageError("Codex app-server exited before returning limits. Check `codex login`.")
+            try:
+                message = json.loads(line)
+            except ValueError as e:
+                raise UsageError("Codex app-server returned invalid JSON.") from e
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue  # Notifications can arrive between request responses.
+            if "error" in message:
+                raise UsageError("Codex could not read account limits. Check your connection and `codex login` with ChatGPT.")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise UsageError("Codex app-server returned an invalid response.")
+            return result
+
+    try:
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": {
+            "name": "geekmagic_usage", "title": "GeekMagic Usage", "version": "1.0.0",
+        }}})
+        receive(1)
+        send({"method": "initialized", "params": {}})
+        send({"id": 2, "method": "account/rateLimits/read"})
+        result = receive(2)
+        buckets = result.get("rateLimitsByLimitId")
+        # Prefer the Codex bucket when multiple model quotas are returned.
+        limits = buckets.get("codex") if isinstance(buckets, dict) else None
+        if limits is None:
+            limits = result.get("rateLimits")
+        if not isinstance(limits, dict) or not any(limits.get(w) for w in ("primary", "secondary")):
+            raise UsageError("Codex returned no account limits. Sign in with ChatGPT using `codex login`.")
+        return limits
+    except OSError as e:
+        raise UsageError("Lost connection to Codex app-server.") from e
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=2)
+        proc.stdout.close()
+
+
+def fetch_codex_usage() -> dict:
+    """Fetch fresh account limits, even when the user is not actively using Codex."""
+    limits = _fetch_codex_rate_limits()
+    now = datetime.now().astimezone()
+
+    def window(block: dict | None) -> tuple[float | None, datetime | None]:
+        if block is None:
+            return None, None
+        if not isinstance(block, dict):
+            raise UsageError("Codex returned an invalid quota window.")
+        try:
+            reset = datetime.fromtimestamp(block["resetsAt"]).astimezone() if block.get("resetsAt") else None
+            return float(block["usedPercent"]), reset
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as e:
+            raise UsageError("Codex returned an invalid quota window.") from e
+
+    current_pct, current_reset = window(limits.get("primary"))
+    weekly_pct, weekly_reset = window(limits.get("secondary"))
+    return {
+        "title": "Codex",
+        "current_pct": current_pct, "current_reset": current_reset,
+        "weekly_pct": weekly_pct, "weekly_reset": weekly_reset,
+        "now": now,
+    }
+
+
+PROVIDERS = {"claude": fetch_usage, "codex": fetch_codex_usage}
+
+
 def _parse(text: str) -> dict:
     now = datetime.now().astimezone()
     session = _SESSION_RE.search(text)
@@ -96,6 +246,7 @@ def _parse(text: str) -> dict:
     if not session and not week:
         raise UsageError("Could not find usage lines in /usage output:\n" + text)
     return {
+        "title": "Claude",
         "current_pct": float(session.group(1)) if session else None,
         "current_reset": _parse_reset(session.group(2), now) if session and session.group(2) else None,
         "weekly_pct": float(week.group(1)) if week else None,
@@ -150,15 +301,41 @@ _MASCOT_BITMAP = (
 )
 
 
-def _draw_mascot(image: Image.Image, top_left: tuple[int, int], cell_size: int) -> None:
+# Codex's mascot: a little cloud (an original pixel-art take on a terminal-in-the-cloud),
+# same 14x8 footprint as the Claude one. Its `>_` prompt is drawn per frame by _prompt_layer.
+_CODEX_BITMAP = (
+    "00000000000000",
+    "00000011110000",
+    "00011011111100",
+    "00111111111110",
+    "01111111111111",
+    "01111111111111",
+    "01111111111111",
+    "00111111111110",
+)
+_INK = "#0F0D0B"
+
+# Per-provider look, picked by usage["title"]: mascot bitmap + body colour, and the two bar accents.
+THEMES = {
+    "Claude": {"bitmap": _MASCOT_BITMAP, "body": ACCENT, "current": CURRENT_ACCENT, "weekly": WEEKLY_ACCENT},
+    "Codex": {"bitmap": _CODEX_BITMAP, "body": "#4F9DFF", "current": "#4F9DFF", "weekly": "#B79CFF"},
+}
+
+
+def _theme(usage: dict) -> dict:
+    return THEMES.get(usage.get("title"), THEMES["Claude"])
+
+
+def _draw_mascot(image: Image.Image, top_left: tuple[int, int], cell_size: int, theme: dict | None = None) -> None:
     """Blocky pixel-art mascot, drawn cell by cell so it stays crisp at small sizes."""
+    theme = theme or THEMES["Claude"]
     x0, y0 = top_left
     draw = ImageDraw.Draw(image)
-    for row, line in enumerate(_MASCOT_BITMAP):
+    for row, line in enumerate(theme["bitmap"]):
         for col, cell in enumerate(line):
             if cell == "0":
                 continue
-            fill = ACCENT if cell == "1" else "#0F0D0B"
+            fill = theme["body"] if cell == "1" else _INK
             x = x0 + col * cell_size
             y = y0 + row * cell_size
             draw.rectangle((x, y, x + cell_size - 1, y + cell_size - 1), fill=fill)
@@ -366,6 +543,160 @@ ANIMATIONS: dict[str, tuple[tuple[int, int, object], ...]] = {
     ),
 }
 DEFAULT_ANIMATION = "laptop"
+# Each provider rotates through its own set; "auto"/"random" (the default) pick one, never the same twice in a row.
+ANIMATION_GROUPS = {
+    "Claude": ("idle", "laptop", "coffee", "eureka", "dance", "typing"),
+    "Codex": ("prompt", "think", "sparkle", "bolt", "code", "hop"),
+}
+
+
+# --- Codex animations: all drawn on the 14x8 cloud grid (3 px cells), see _CODEX_BITMAP -----------------
+
+def _cell(image: Image.Image, col: int, row: int, color: str = _INK, dy: int = 0) -> None:
+    """One 3x3 px cell of the mascot grid; `dy` follows a bobbing/hopping cloud."""
+    x, y = 10 + col * 3, _MASCOT_TOP + row * 3 + dy
+    ImageDraw.Draw(image).rectangle((x, y, x + 2, y + 2), fill=color)
+
+
+_CHEVRON = ((3, 4), (4, 5), (3, 6))  # the `>` of `>_`
+_BOLT = ((8, 3), (7, 4), (8, 4), (6, 5), (7, 5), (7, 6), (8, 6), (7, 7), (6, 8))
+_BRACKET_L = ((2, 4), (3, 4), (2, 5), (2, 6), (3, 6))
+_BRACKET_R = ((11, 4), (10, 4), (11, 5), (11, 6), (10, 6))
+_SPARK_COLOR = "#CFE3FF"
+_SPARK_SPOTS = ((14, 3), (32, 2), (46, 5), (55, 15), (56, 27))  # top-left px of each sparkle, around the cloud
+_FLASH_BODY = "#A9CFFF"
+_BOLT_COLOR = "#FFD966"
+_SHADOW_COLOR = "#3A352C"
+
+
+def _prompt_layer(chevron: bool = True, dots: int = 0, cursor: int | None = None, dy: int = 0):
+    """Codex's `>_` prompt on the cloud: a chevron, then `dots` typed dots, then a cursor block at column `cursor`."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        if chevron:
+            for col, row in _CHEVRON:
+                _cell(image, col, row, dy=dy)
+        for i in range(dots):
+            _cell(image, 7 + i * 2, 6, dy=dy)  # dots sit on the baseline, like periods
+        if cursor is not None:
+            for col in (cursor, cursor + 1):
+                _cell(image, col, 6, dy=dy)
+    return draw
+
+
+def _think_layer(dots: int, dy: int):
+    """`dots` dots in the middle of a bobbing cloud: it's thinking."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        for i in range(dots):
+            _cell(image, 5 + 2 * i, 5, dy=dy)
+    return draw
+
+
+def _sparkle_layer(phase: int):
+    """A resting `>_` with sparkles twinkling around the cloud (each one cycles off, dot, plus, dot)."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        for col, row in (*_CHEVRON, (7, 6), (8, 6)):
+            _cell(image, col, row)
+        d = ImageDraw.Draw(image)
+        for i, (x, y) in enumerate(_SPARK_SPOTS):
+            stage = (phase + i) % 4
+            if stage == 0:
+                continue
+            d.rectangle((x + 2, y + 2, x + 3, y + 3), fill=_SPARK_COLOR)  # centre dot
+            if stage == 2:  # plus-shaped arms
+                for ax, ay in ((x + 2, y), (x + 2, y + 4), (x, y + 2), (x + 4, y + 2)):
+                    d.rectangle((ax, ay, ax + 1, ay + 1), fill=_SPARK_COLOR)
+    return draw
+
+
+def _bolt_layer(flash: bool):
+    """Calm `>_`, or a lightning flash: the cloud lights up and a bolt strikes out of it."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        if not flash:
+            for col, row in (*_CHEVRON, (7, 6), (8, 6)):
+                _cell(image, col, row)
+            return
+        for row, line in enumerate(_CODEX_BITMAP):
+            for col, ch in enumerate(line):
+                if ch == "1":
+                    _cell(image, col, row, _FLASH_BODY)
+        for col, row in _BOLT:
+            _cell(image, col, row, _BOLT_COLOR)
+    return draw
+
+
+def _code_layer(left: bool = False, right: bool = False, dots: int = 0):
+    """`[ ... ]` brackets appearing on the cloud, with `dots` typed inside."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        for col, row in (_BRACKET_L if left else ()):
+            _cell(image, col, row)
+        for col, row in (_BRACKET_R if right else ()):
+            _cell(image, col, row)
+        for i in range(dots):
+            _cell(image, 4 + 2 * i, 5)
+    return draw
+
+
+def _hop_layer(dy: int, lift: int):
+    """The cloud hopping: `>_` rides along, and the shadow on the ground shrinks as it rises (`lift` px)."""
+    def draw(image: Image.Image, mascot_w: int) -> None:
+        half = max(8, 17 - lift)
+        ImageDraw.Draw(image).rectangle((31 - half, 36, 31 + half, 37), fill=_SHADOW_COLOR)
+        for col, row in (*_CHEVRON, (7, 6), (8, 6)):
+            _cell(image, col, row, dy=dy)
+    return draw
+
+
+_HOP_DY = (0, 0, -3, -6, -8, -8, -6, -3, 0, 2, 0)
+
+ANIMATIONS["prompt"] = (  # the prompt appears, the cursor blinks, then it types three dots
+    (0, 0, None), (0, 0, None),
+    (0, 0, _prompt_layer()),
+    (0, 0, _prompt_layer(cursor=7)), (0, 0, _prompt_layer(cursor=7)),
+    (0, 0, _prompt_layer()), (0, 0, _prompt_layer()),
+    (0, 0, _prompt_layer(cursor=7)), (0, 0, _prompt_layer(cursor=7)),
+    (0, 0, _prompt_layer(dots=1, cursor=9)), (0, 0, _prompt_layer(dots=1, cursor=9)),
+    (0, 0, _prompt_layer(dots=2, cursor=11)), (0, 0, _prompt_layer(dots=2, cursor=11)),
+    (0, 0, _prompt_layer(dots=3)), (0, 0, _prompt_layer(dots=3)), (0, 0, _prompt_layer(dots=3)),
+    (0, 0, _prompt_layer()), (0, 0, _prompt_layer()),
+)
+ANIMATIONS["think"] = tuple(  # bobbing cloud (one bob cycle = smaller GIF), dots 0..3 cycling
+    (0, _IDLE_BOB[i], _think_layer((i // 2) % 4, _IDLE_BOB[i])) for i in range(8)
+)
+ANIMATIONS["sparkle"] = tuple((0, 0, _sparkle_layer(i)) for i in range(8))
+ANIMATIONS["bolt"] = (
+    *((0, 0, _bolt_layer(False)),) * 5,
+    (0, 0, _bolt_layer(True)), (0, 0, _bolt_layer(True)),
+    (0, 0, _bolt_layer(False)),
+    (0, 0, _bolt_layer(True)),
+    *((0, 0, _bolt_layer(False)),) * 4,
+)
+ANIMATIONS["code"] = (  # [ ] brackets appear, three dots get typed inside
+    (0, 0, None), (0, 0, None),
+    (0, 0, _code_layer(left=True)), (0, 0, _code_layer(left=True)),
+    (0, 0, _code_layer(left=True, right=True)), (0, 0, _code_layer(left=True, right=True)),
+    (0, 0, _code_layer(True, True, 1)), (0, 0, _code_layer(True, True, 1)),
+    (0, 0, _code_layer(True, True, 2)), (0, 0, _code_layer(True, True, 2)),
+    (0, 0, _code_layer(True, True, 3)), (0, 0, _code_layer(True, True, 3)), (0, 0, _code_layer(True, True, 3)),
+    (0, 0, _code_layer(True, True)), (0, 0, _code_layer(True, True)),
+)
+ANIMATIONS["hop"] = tuple((0, dy, _hop_layer(dy, -dy)) for dy in _HOP_DY)
+
+RECENT_ANIMATIONS = 3  # an animation can't come back until this many different ones have played
+_recent_animations: dict[str, list[str]] = {}  # per provider title, oldest first
+
+
+def _pick_animation(usage: dict) -> str:
+    """A random animation from the provider's own set, none of the last RECENT_ANIMATIONS shown.
+
+    The history only grows once an upload succeeds (see push_usage), so a cancelled or failed upload
+    can't make the next pick repeat something that is actually on screen.
+    """
+    import random
+    title = usage.get("title", "Claude")
+    group = ANIMATION_GROUPS.get(title, ANIMATION_GROUPS["Claude"])
+    keep_out = min(RECENT_ANIMATIONS, len(group) - 1)  # always leave at least one candidate
+    recent = _recent_animations.get(title, [])[-keep_out:] if keep_out else []
+    return random.choice([a for a in group if a not in recent])
 
 
 def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=None) -> Image.Image:
@@ -378,31 +709,32 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
     reset_font = ImageFont.load_default(size=14)
     footer_font = ImageFont.load_default(size=13)
 
+    theme = _theme(usage)
     mascot_cell = 3
-    mascot_w = mascot_cell * len(_MASCOT_BITMAP[0])
-    _draw_mascot(image, (10 + mascot_dx, _MASCOT_TOP + mascot_dy), mascot_cell)
+    mascot_w = mascot_cell * len(theme["bitmap"][0])
+    _draw_mascot(image, (10 + mascot_dx, _MASCOT_TOP + mascot_dy), mascot_cell, theme)
 
     if extra is not None:
         extra(image, mascot_w)
 
-    draw.text((10 + mascot_w + 10, 8), "Usage", font=title_font, fill=TEXT)
+    draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=title_font, fill=TEXT)
 
     _draw_section(
         draw, top=40, label="Current", percent=usage["current_pct"],
         reset_text=_format_delta(usage["current_reset"], usage["now"]),
-        accent=CURRENT_ACCENT,
+        accent=theme["current"],
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
     )
     _draw_section(
         draw, top=134, label="Weekly", percent=usage["weekly_pct"],
         reset_text=_format_delta(usage["weekly_reset"], usage["now"]),
-        accent=WEEKLY_ACCENT,
+        accent=theme["weekly"],
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
     )
 
     footer_text = f"* Updated {usage['now']:%H:%M}"
     bbox = draw.textbbox((0, 0), footer_text, font=footer_font)
-    draw.text((((240 - (bbox[2] - bbox[0])) // 2), 223), footer_text, font=footer_font, fill=CURRENT_ACCENT)
+    draw.text((((240 - (bbox[2] - bbox[0])) // 2), 223), footer_text, font=footer_font, fill=theme["current"])
 
     return image
 
@@ -418,7 +750,11 @@ def render_animation(usage: dict, animation: str = DEFAULT_ANIMATION) -> bytes:
     """Looping GIF for one of the named ANIMATIONS presets."""
     frames_spec = ANIMATIONS[animation]
     frames = [_render_frame(usage, dx, dy, extra) for dx, dy, extra in frames_spec]
-    base = frames[0].convert("P", palette=Image.ADAPTIVE, colors=64)
+    # One palette built from *all* frames, so colours that only appear later (a bolt, sparkles, steam) survive.
+    sheet = Image.new("RGB", (WIDTH, HEIGHT * len(frames)))
+    for i, frame in enumerate(frames):
+        sheet.paste(frame, (0, i * HEIGHT))
+    base = sheet.quantize(colors=96)
     quantized = [f.quantize(palette=base) for f in frames]
     buf = BytesIO()
     quantized[0].save(
@@ -456,7 +792,32 @@ def _draw_section(draw, *, top, label, percent, reset_text, accent, pill_font, p
     draw.text((panel_left + pad, top + 68), reset_text, font=reset_font, fill=MUTED)
 
 
-def upload(ip: str, image_bytes: bytes, filename: str = IMAGE_NAME, content_type: str = "image/gif") -> None:
+CONNECT_TIMEOUT = 3  # seconds to reach the device / get a reply to a small request; a switched-off one fails fast
+UPLOAD_TIMEOUT = 15  # seconds to let the device finish storing an uploaded GIF (~3 s in practice)
+
+
+class UploadCancelled(Exception):
+    pass
+
+
+def _abort_on_cancel(cancel: threading.Event, done: threading.Event, sock) -> None:
+    """Watcher: when `cancel` fires mid-upload, reset the connection so the device stops receiving at once."""
+    while not done.is_set():
+        if cancel.wait(0.05):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # RST, drop buffered data
+                sock.shutdown(socket.SHUT_RDWR)  # close() alone is deferred while the response reader holds the socket
+                sock.close()
+            except OSError:
+                pass
+            return
+
+
+def upload(
+    ip: str, image_bytes: bytes, filename: str = IMAGE_NAME, content_type: str = "image/gif", show: bool = True,
+    cancel: threading.Event | None = None,
+) -> None:
+    """POST the image to the device. Setting `cancel` aborts the transfer and raises UploadCancelled."""
     boundary = "----geekmagicclaude"
     body = (
         f"--{boundary}\r\n"
@@ -464,18 +825,59 @@ def upload(ip: str, image_bytes: bytes, filename: str = IMAGE_NAME, content_type
         f"Content-Type: {content_type}\r\n\r\n"
     ).encode() + image_bytes + f"\r\n--{boundary}--\r\n".encode()
 
-    req = urllib.request.Request(
-        f"http://{ip}/doUpload?dir=/image/",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    if cancel is not None and cancel.is_set():
+        raise UploadCancelled()
+    conn = http.client.HTTPConnection(ip, timeout=CONNECT_TIMEOUT)
+    done = threading.Event()
+    try:
+        conn.connect()
+        conn.sock.settimeout(UPLOAD_TIMEOUT)  # connecting fails fast; the device then needs seconds to store the file
+        # A tiny send buffer makes us send at the device's pace instead of dumping the whole file into
+        # the OS buffer at once, so a cancel can still stop the transfer while the device is busy writing.
+        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        if cancel is not None:
+            threading.Thread(target=_abort_on_cancel, args=(cancel, done, conn.sock), daemon=True).start()
+        conn.request(
+            "POST", "/doUpload?dir=/image/",
+            body=(body[i:i + 2048] for i in range(0, len(body), 2048)),
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp.read()
         if resp.status >= 300:
             raise UsageError(f"Upload failed: HTTP {resp.status}")
+    except Exception:
+        if cancel is not None and cancel.is_set():
+            raise UploadCancelled() from None
+        raise
+    finally:
+        done.set()
+        conn.close()
 
-    urllib.request.urlopen(f"http://{ip}/set?theme=3", timeout=10).read()
-    urllib.request.urlopen(f"http://{ip}/set?img=/image/{filename}", timeout=10).read()
+    if show:
+        show_image(ip, filename)
+
+
+def list_images(ip: str) -> set[str]:
+    """Names of the image files stored on the device (parsed from its file-list page)."""
+    html = urllib.request.urlopen(f"http://{ip}/filelist?dir=/image/", timeout=CONNECT_TIMEOUT).read().decode("utf-8", "replace")
+    return set(re.findall(r"[\w.\-]+\.(?:gif|jpe?g|png)", html, re.IGNORECASE))
+
+
+def delete_image(ip: str, filename: str) -> None:
+    urllib.request.urlopen(f"http://{ip}/delete?file=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
+
+
+def show_image(ip: str, filename: str) -> None:
+    """Pin an already-uploaded image on screen (fast: no file transfer)."""
+    urllib.request.urlopen(f"http://{ip}/set?theme=3", timeout=CONNECT_TIMEOUT).read()
+    urllib.request.urlopen(f"http://{ip}/set?img=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
+
+
+_cleaned_up = False
 
 
 def _cleanup_old_images(ip: str) -> None:
@@ -486,14 +888,28 @@ def _cleanup_old_images(ip: str) -> None:
             pass
 
 
-def run_once(ip: str, animation: str) -> None:
-    usage = fetch_usage()
-    if animation == "random":
-        import random
-        animation = random.choice(list(ANIMATIONS))
+def run_once(ip: str, animation: str, provider: str = "claude") -> None:
+    push_usage(ip, PROVIDERS[provider](), animation, IMAGE_NAMES[provider])
+
+
+def push_usage(
+    ip: str, usage: dict, animation: str, filename: str = IMAGE_NAME, show: bool = True,
+    cancel: threading.Event | None = None,
+) -> None:
+    """Render and upload `usage` as `filename`; `show=False` uploads without switching the screen to it."""
+    rotating = animation in ("auto", "random")
+    if rotating:
+        animation = _pick_animation(usage)
     gif_bytes = render_animation(usage, animation)
-    upload(ip, gif_bytes, IMAGE_NAME, "image/gif")
-    _cleanup_old_images(ip)
+    upload(ip, gif_bytes, filename, "image/gif", show, cancel)
+    if rotating:
+        history = _recent_animations.setdefault(usage.get("title", "Claude"), [])
+        history.append(animation)  # now it really is on the device
+        del history[:-RECENT_ANIMATIONS]
+    global _cleaned_up
+    if not _cleaned_up:  # one-time migration cleanup, not worth an extra request every push
+        _cleanup_old_images(ip)
+        _cleaned_up = True
     print(
         f"[{usage['now']:%H:%M:%S}] pushed [{animation}] ({len(gif_bytes) / 1024:.1f} KB) — "
         f"current {usage['current_pct']}% / weekly {usage['weekly_pct']}%"
@@ -505,21 +921,22 @@ def main() -> int:
     parser.add_argument("--ip", required=True, help="GeekMagic device IP, e.g. 192.168.1.18")
     parser.add_argument("--loop", type=int, metavar="SECONDS", help="repeat forever every N seconds")
     parser.add_argument(
-        "--animation", default=DEFAULT_ANIMATION, choices=[*ANIMATIONS, "random"],
-        help="which named animation to show (or 'random' to pick a different one each push)",
+        "--animation", default="auto", choices=[*ANIMATIONS, "auto", "random"],
+        help="which animation: 'auto'/'random' (default) picks a random one from the provider's own set on every push, or name one",
     )
+    parser.add_argument("--provider", default="claude", choices=list(PROVIDERS), help="which usage to show")
     args = parser.parse_args()
 
     try:
         if args.loop:
             while True:
                 try:
-                    run_once(args.ip, args.animation)
-                except UsageError as e:
+                    run_once(args.ip, args.animation, args.provider)
+                except (UsageError, OSError, ValueError) as e:
                     print(f"warning: {e}", file=sys.stderr)
                 time.sleep(args.loop)
         else:
-            run_once(args.ip, args.animation)
+            run_once(args.ip, args.animation, args.provider)
     except UsageError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

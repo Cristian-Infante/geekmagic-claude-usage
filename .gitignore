@@ -7,3 +7,8 @@ log.txt
 !docs/**/*.png
 !docs/**/*.gif
 !docs/**/*.jpg
+
+# tray app runtime files
+tray.log
+tray.log.1
+tray_state.json
