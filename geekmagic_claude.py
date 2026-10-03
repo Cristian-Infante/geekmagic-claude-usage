@@ -37,6 +37,8 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 
 import alerts
+import pace
+import usage_stats
 
 WIDTH = HEIGHT = 240
 IMAGE_NAME = "claude-usage.gif"
@@ -101,7 +103,7 @@ def fetch_usage() -> dict:
     result = payload.get("result")
     if payload.get("is_error") or not isinstance(result, str):
         raise UsageError("Claude Code did not return usage text.")
-    return _parse(result)
+    return pace.annotate(_parse(result))
 
 
 CODEX_TIMEOUT = 30
@@ -198,7 +200,7 @@ def _fetch_codex_rate_limits() -> dict:
             limits = result.get("rateLimits")
         if not isinstance(limits, dict) or not any(limits.get(w) for w in ("primary", "secondary")):
             raise UsageError("Codex returned no account limits. Sign in with ChatGPT using `codex login`.")
-        return limits
+        return {**limits, "_reset_credits": result.get("rateLimitResetCredits")}  # the free resets sit beside the limits
     except OSError as e:
         raise UsageError("Lost connection to Codex app-server.") from e
     finally:
@@ -233,11 +235,32 @@ def fetch_codex_usage() -> dict:
 
     current_pct, current_reset = window(limits.get("primary"))
     weekly_pct, weekly_reset = window(limits.get("secondary"))
-    return {
+    usage = {
         "title": "Codex",
         "current_pct": current_pct, "current_reset": current_reset,
         "weekly_pct": weekly_pct, "weekly_reset": weekly_reset,
         "now": now,
+    }
+    # Codex says how long each window really is (300 and 10080 minutes at the time of writing).
+    lengths = {w: limits[key]["windowDurationMins"] for w, key in (("current", "primary"), ("weekly", "secondary"))
+               if isinstance(limits.get(key), dict) and isinstance(limits[key].get("windowDurationMins"), (int, float))}
+    if lengths:
+        usage["window_min"] = lengths
+    usage["codex_extra"] = _codex_extra(limits)
+    return pace.annotate(usage)
+
+
+def _codex_extra(limits: dict) -> dict:
+    """Plan, credits and free rate-limit resets, for the stats screen. Every field is optional in Codex's reply."""
+    credits = limits.get("credits") if isinstance(limits.get("credits"), dict) else {}
+    resets = limits.get("_reset_credits") if isinstance(limits.get("_reset_credits"), dict) else {}
+    available = [c for c in resets.get("credits", []) if isinstance(c, dict) and c.get("status") == "available"]
+    expiries = [c["expiresAt"] for c in available if isinstance(c.get("expiresAt"), (int, float))]
+    return {
+        "plan": limits.get("planType") if isinstance(limits.get("planType"), str) else None,
+        "credits": "unlimited" if credits.get("unlimited") else (str(credits.get("balance")) if credits.get("hasCredits") else None),
+        "free_resets": resets.get("availableCount", len(available)) or 0,
+        "next_reset_expires_days": max(0, round((min(expiries) - time.time()) / 86400)) if expiries else None,
     }
 
 
@@ -257,6 +280,7 @@ def _parse(text: str) -> dict:
         "weekly_pct": float(week.group(1)) if week else None,
         "weekly_reset": _parse_reset(week.group(2), now) if week and week.group(2) else None,
         "now": now,
+        "stats": usage_stats.parse_claude_stats(text),  # the "Last 24h / Last 7d" activity blocks, for the stats screen
     }
 
 
@@ -734,12 +758,14 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
         reset_text=_format_delta(usage["current_reset"], usage["now"]),
         accent=theme["current"],
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
+        pace_info=_pace_info(usage, "current"), pace_font=footer_font,
     )
     _draw_section(
         draw, top=134, label="Weekly", percent=usage["weekly_pct"],
         reset_text=_format_delta(usage["weekly_reset"], usage["now"]),
         accent=theme["weekly"],
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
+        pace_info=_pace_info(usage, "weekly"), pace_font=footer_font,
     )
 
     if usage.get("stale"):
@@ -788,7 +814,7 @@ def _encode_gif(frames: list[Image.Image]) -> bytes:
 SPLIT_PANEL_H = 118  # two panels of this height, a 4 px divider between them
 
 
-def _draw_split_row(draw, *, top, label, percent, reset_text, accent, fonts) -> None:
+def _draw_split_row(draw, *, top, label, percent, reset_text, accent, fonts, pace_info=None) -> None:
     """One compact usage row: big number + bar on the first line, label + reset countdown under it."""
     state = alerts.bar_state(percent)
     color = STATE_COLORS.get(state, accent)
@@ -804,26 +830,128 @@ def _draw_split_row(draw, *, top, label, percent, reset_text, accent, fonts) -> 
             )
     draw.text((10, top + 26), label, font=fonts["small"], fill=MUTED)
     draw.text((bar_left, top + 26), reset_text, font=fonts["small"], fill=MUTED)
+    _draw_pace(draw, pace_info, right=230, y=top + 26, left_end=bar_left + draw.textlength(reset_text, font=fonts["small"]), font=fonts["small"])
 
 
-def _draw_split_panel(image: Image.Image, top: int, usage: dict, bob: int, fonts: dict) -> None:
-    """One provider's panel (header + two rows) at vertical offset `top`; dimmed and dated if `usage["stale"]`."""
+SPLIT_ART = (64, 40)  # the mascot-and-props corner of a split panel: the same art, at the same scale, as the single screens
+
+
+def _header_art(usage: dict, frame: tuple) -> Image.Image:
+    """The top-left corner of a single-provider screen for one animation frame (mascot at full size plus whatever it
+    holds: laptop, mug, bolt, sparkles...). The animations draw at absolute coordinates, so draw the real thing on a
+    scratch screen and cut the corner out."""
+    scratch = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    dx, dy, extra = frame
+    theme = _theme(usage)
+    _draw_mascot(scratch, (10 + dx, _MASCOT_TOP + dy), 3, theme)
+    if extra is not None:
+        extra(scratch, 3 * len(theme["bitmap"][0]))
+    return scratch.crop((0, 0, *SPLIT_ART))
+
+
+def _draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, fonts: dict) -> None:
+    """One provider's panel (animated header + two rows) at vertical offset `top`; dimmed and dated if stale."""
     theme = _theme(usage)
     draw = ImageDraw.Draw(image)
-    _draw_mascot(image, (10, top + 8 + bob), 2, theme)
+    image.paste(_header_art(usage, (0, 0, None) if usage.get("stale") else frame), (0, top))
+    draw.text((SPLIT_ART[0] + 2, top + 8), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
+    updated = _clock(usage["now"])
+    if not usage.get("stale"):
+        width = draw.textlength(updated, font=fonts["small"])
+        draw.text((230 - width, top + 12), updated, font=fonts["small"], fill=theme["current"])
+    for row_top, label, window, accent in (
+        (top + 40, "Session", "current", theme["current"]),
+        (top + 77, "Weekly", "weekly", theme["weekly"]),
+    ):
+        _draw_split_row(
+            draw, top=row_top, label=label, percent=usage[f"{window}_pct"],
+            reset_text=_format_delta(usage[f"{window}_reset"], usage["now"]), accent=accent, fonts=fonts,
+            pace_info=_pace_info(usage, window),
+        )
+    if usage.get("stale"):
+        box = (0, top, WIDTH, top + SPLIT_PANEL_H)
+        image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
+        text = f"! stale since {updated}"
+        width = ImageDraw.Draw(image).textlength(text, font=fonts["small"])
+        ImageDraw.Draw(image).text((230 - width, top + 12), text, font=fonts["small"], fill=STATE_COLORS["warn"])
+
+
+def _render_split_frame(panels: list[dict], animations: list[str] | None = None, index: int = 0) -> Image.Image:
+    """Frame `index` of the split view. Each panel plays its own animation (default: just the idle bob); a shorter
+    one simply loops again while a longer one is still going."""
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    fonts = {
+        "title": ImageFont.load_default(size=18), "pct": ImageFont.load_default(size=22),
+        "small": ImageFont.load_default(size=11),
+    }
+    animations = animations or []
+    for i, usage in enumerate(panels[:2]):
+        spec = ANIMATIONS[animations[i] if i < len(animations) else "idle"]
+        _draw_split_panel(image, i * (SPLIT_PANEL_H + 4), usage, spec[index % len(spec)], fonts)
+    ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)  # divider
+    return image
+
+
+def render_split(panels: list[dict], animations: list[str] | None = None) -> bytes:
+    """Looping GIF with two providers' usage stacked on one screen, each mascot doing its own animation."""
+    animations = animations or []
+    length = max((len(ANIMATIONS[animations[i] if i < len(animations) else "idle"]) for i in range(len(panels[:2]))),
+                 default=len(_IDLE_BOB))
+    return _encode_gif([_render_split_frame(panels, animations, index) for index in range(length)])
+
+
+def _animation_for(usage: dict, requested: str) -> str:
+    """The animation a provider's panel should play: the one asked for if it's one of that provider's, else a
+    random one from its own set (never one of its last three)."""
+    group = ANIMATION_GROUPS.get(usage.get("title", "Claude"), ANIMATION_GROUPS["Claude"])
+    return requested if requested in group else _pick_animation(usage)
+
+
+def push_split(
+    ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
+    animation: str = "auto",
+) -> None:
+    """Render and upload the split view as `filename`. Like the single screens, "auto"/"random" gives each provider
+    a fresh animation of its own on every push, remembered once the upload has gone through."""
+    names = [_animation_for(usage, animation) for usage in panels[:2]]
+    upload(ip, render_split(panels, names), filename, "image/gif", show, cancel)
+    if animation in ("auto", "random"):
+        for usage, name in zip(panels[:2], names):
+            history = _recent_animations.setdefault(usage.get("title", "Claude"), [])
+            history.append(name)
+            del history[:-RECENT_ANIMATIONS]
+
+
+# --- Stats view: activity numbers for both providers ------------------------------------------------------
+
+def stats_lines(usage: dict) -> list[str]:
+    """What a provider's stats panel says (see usage_stats): Claude's activity blocks, Codex's plan and local counts."""
+    if usage.get("title") == "Codex":
+        return usage_stats.codex_lines(usage, usage.get("local_stats"))
+    return usage_stats.claude_lines(usage.get("stats"))
+
+
+def _fit(draw, text: str, font, width: float) -> str:
+    """`text` shortened with "..." to fit `width` pixels."""
+    if draw.textlength(text, font=font) <= width:
+        return text
+    while text and draw.textlength(text + "...", font=font) > width:
+        text = text[:-1]
+    return text.rstrip() + "..."
+
+
+def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    theme = _theme(usage)
+    draw = ImageDraw.Draw(image)
+    _draw_mascot(image, (10, top + 8), 2, theme)
     draw.text((46, top + 5), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
     updated = _clock(usage["now"])
     if not usage.get("stale"):
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
-    for row_top, label, pct_key, reset_key, accent in (
-        (top + 32, "Session", "current_pct", "current_reset", theme["current"]),
-        (top + 74, "Weekly", "weekly_pct", "weekly_reset", theme["weekly"]),
-    ):
-        _draw_split_row(
-            draw, top=row_top, label=label, percent=usage[pct_key],
-            reset_text=_format_delta(usage[reset_key], usage["now"]), accent=accent, fonts=fonts,
-        )
+    for i, line in enumerate(stats_lines(usage)[:5]):
+        draw.text((10, top + 32 + i * 17), _fit(draw, line, fonts["body"], 220), font=fonts["body"],
+                  fill=TEXT if i < 2 else MUTED)
     if usage.get("stale"):
         box = (0, top, WIDTH, top + SPLIT_PANEL_H)
         image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
@@ -832,31 +960,32 @@ def _draw_split_panel(image: Image.Image, top: int, usage: dict, bob: int, fonts
         ImageDraw.Draw(image).text((230 - width, top + 10), text, font=fonts["small"], fill=STATE_COLORS["warn"])
 
 
-def _render_split_frame(panels: list[dict], bob: int = 0) -> Image.Image:
+def _render_stats_frame(panels: list[dict]) -> Image.Image:
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
-    fonts = {
-        "title": ImageFont.load_default(size=17), "pct": ImageFont.load_default(size=22),
-        "small": ImageFont.load_default(size=11),
-    }
+    fonts = {"title": ImageFont.load_default(size=17), "body": ImageFont.load_default(size=12),
+             "small": ImageFont.load_default(size=11)}
     for i, usage in enumerate(panels[:2]):
-        _draw_split_panel(image, i * (SPLIT_PANEL_H + 4), usage, bob, fonts)
-    ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)  # divider
+        _draw_stats_panel(image, i * (SPLIT_PANEL_H + 4), usage, fonts)
+    ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)
     return image
 
 
-def render_split(panels: list[dict]) -> bytes:
-    """Looping GIF with two providers' usage stacked on one screen (their mascots bob gently)."""
-    return _encode_gif([_render_split_frame(panels, bob) for bob in _IDLE_BOB])
+def render_stats(panels: list[dict]) -> bytes:
+    """A still GIF (so a small upload) with both providers' activity stats."""
+    return _encode_gif([_render_stats_frame(panels)])
 
 
-def push_split(
+def push_stats(
     ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
 ) -> None:
-    """Render and upload the split view as `filename`."""
-    upload(ip, render_split(panels), filename, "image/gif", show, cancel)
+    upload(ip, render_stats(panels), filename, "image/gif", show, cancel)
 
 
-def _draw_section(draw, *, top, label, percent, reset_text, accent, pill_font, pct_font, reset_font) -> None:
+
+
+def _draw_section(
+    draw, *, top, label, percent, reset_text, accent, pill_font, pct_font, reset_font, pace_info=None, pace_font=None,
+) -> None:
     panel_left, panel_right = 10, 230
     pad = 4
     pct_text = f"{percent:.0f}%" if percent is not None else "--%"
@@ -884,6 +1013,25 @@ def _draw_section(draw, *, top, label, percent, reset_text, accent, pill_font, p
             )
 
     draw.text((panel_left + pad, top + 68), reset_text, font=reset_font, fill=MUTED)
+    _draw_pace(draw, pace_info, right=panel_right - pad, y=top + 70, left_end=panel_left + pad + draw.textlength(reset_text, font=reset_font), font=pace_font)
+
+
+def _draw_pace(draw, pace_info, *, right: int, y: int, left_end: float, font) -> None:
+    """The projection ("Full in 1h 30m" / "~62% at reset"), right-aligned; skipped if it wouldn't fit next to the
+    reset countdown, which matters more."""
+    if not pace_info:
+        return
+    text, state = pace_info
+    width = draw.textlength(text, font=font)
+    if left_end + 10 < right - width:
+        draw.text((right - width, y), text, font=font, fill=STATE_COLORS.get(state, MUTED))
+
+
+def _pace_info(usage: dict, window: str):
+    """(text, state) projection for a usage window, or None (also None while the numbers are stale)."""
+    if usage.get("stale"):
+        return None
+    return pace.describe((usage.get("pace") or {}).get(window))
 
 
 CONNECT_TIMEOUT = 3  # seconds to reach the device / get a reply to a small request; a switched-off one fails fast
@@ -985,6 +1133,36 @@ def show_image(ip: str, filename: str) -> None:
     """Pin an already-uploaded image on screen (fast: no file transfer)."""
     urllib.request.urlopen(f"http://{ip}/set?theme=3", timeout=CONNECT_TIMEOUT).read()
     urllib.request.urlopen(f"http://{ip}/set?img=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
+
+
+# --- Brightness and night mode: the device's own settings --------------------------------------------------
+
+BRIGHTNESS_RANGE = (-10, 100)  # the slider range of the device's own settings page
+
+
+def _clamp_brightness(level: float) -> int:
+    return max(BRIGHTNESS_RANGE[0], min(BRIGHTNESS_RANGE[1], int(level)))
+
+
+def _device_set(ip: str, query: str) -> None:
+    """GET /set?<query>: the device answers "OK", or "FAIL" for what it doesn't understand."""
+    body = urllib.request.urlopen(f"http://{ip}/set?{query}", timeout=CONNECT_TIMEOUT).read().decode("utf-8", "replace").strip()
+    if body != "OK":
+        raise OSError(f"the device refused the setting ({body or 'no answer'})")
+
+
+@_device_errors
+def set_brightness(ip: str, level: float) -> None:
+    """Backlight level, -10..100 (the device doesn't let you read the current one back)."""
+    _device_set(ip, f"brt={_clamp_brightness(level)}")
+
+
+@_device_errors
+def set_night_mode(ip: str, *, start_hour: int, end_hour: int, night_level: float, day_level: float, enabled: bool) -> None:
+    """The device's own night schedule: between the two hours it runs at `night_level`, else at `day_level`. It keeps
+    working with the computer off. (Same call as the "Night Mode" section of the device's settings page.)"""
+    _device_set(ip, f"t1={start_hour % 24}&t2={end_hour % 24}&b1={_clamp_brightness(day_level)}"
+                    f"&b2={_clamp_brightness(night_level)}&en={1 if enabled else 0}")
 
 
 _cleaned_up = False

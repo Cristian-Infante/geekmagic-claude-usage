@@ -2,6 +2,7 @@
 import json
 import logging
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -400,6 +401,341 @@ class TrayLogicTests(unittest.TestCase):
             app._refresh_other("claude")  # what the worker does next in its cycle
             app._refresh_outdated_views()
         self.assertEqual(uploads, [], "nothing may take the device away from the click")
+
+    # --- pace: history and projection --------------------------------------------------------------------------
+
+    def reading(self, pct, reset_in_min=150, weekly=5.0, title="Claude"):
+        now = datetime.now().astimezone()
+        return {"title": title, "current_pct": pct, "current_reset": now + timedelta(minutes=reset_in_min),
+                "weekly_pct": weekly, "weekly_reset": now + timedelta(days=3), "now": now}
+
+    def test_readings_are_recorded_when_they_change_and_not_repeated_needlessly(self):
+        app = self.make()
+        first = self.reading(10)
+        app._record_history("claude", first)
+        app._record_history("claude", dict(first))  # same percentage moments later
+        self.assertEqual(len(app.history["claude/current"]), 1)
+        app._record_history("claude", self.reading(12))
+        self.assertEqual([p[1] for p in app.history["claude/current"]], [10, 12])
+        self.assertEqual(len(app.history["claude/weekly"]), 1)
+
+    def test_a_reset_drops_the_readings_of_the_previous_window(self):
+        app = self.make()
+        app._record_history("claude", self.reading(90, reset_in_min=10))
+        app._record_history("claude", self.reading(3, reset_in_min=300))  # a new window began
+        self.assertEqual([p[1] for p in app.history["claude/current"]], [3])
+
+    def test_history_is_capped(self):
+        app = self.make()
+        for pct in range(tray.HISTORY_MAX + 40):
+            app._record_history("claude", self.reading(pct % 99))
+        self.assertLessEqual(len(app.history["claude/current"]), tray.HISTORY_MAX)
+
+    def test_a_fetch_attaches_the_pace_and_a_recent_burst_raises_it(self):
+        app = self.make()
+        now = time.time()
+        reset = datetime.now().astimezone() + timedelta(minutes=150)
+        # 15 minutes ago it was at 30%, now 40%: a burst, faster than the 40/150 average since the window started
+        app.history["claude/current"] = [[now - 900, 30.0, reset.timestamp()]]
+        with patch.dict(g.PROVIDERS, {"claude": lambda: self.reading(40)}):
+            usage = app._fetch_usage("claude")
+        rate = usage["pace"]["current"]["rate"]
+        self.assertGreater(rate, 40 / 150)
+        self.assertAlmostEqual(rate, 10 / 15, places=1)
+
+    def test_history_survives_a_restart(self):
+        app = self.make()
+        app._record_history("claude", self.reading(10))
+        app._record_history("claude", self.reading(14))
+        app._save_state()
+        self.assertEqual([p[1] for p in self.make().history["claude/current"]], [10, 14])
+
+    def test_a_garbled_history_is_ignored(self):
+        (self.tmp / "state.json").write_text(json.dumps({"history": {"claude/current": [[1, 2], "x", [1, 2, 3]], "bad": 5}}))
+        self.assertEqual(self.make().history, {"claude/current": [[1, 2, 3]]})
+
+    # --- pause and the computer being locked -----------------------------------------------------------------
+
+    def run_worker_briefly(self, app, seconds=0.4):
+        thread = threading.Thread(target=app.worker, daemon=True)
+        with patch.object(tray, "PAUSE_POLL", 0.05), patch.object(discover, "probe", return_value=True), \
+                patch.object(g, "push_usage"), patch.object(g, "push_split"), patch.object(g, "show_image"):
+            thread.start()
+            time.sleep(seconds)
+            app.stop.set()
+            app.wake.set()
+            thread.join(2)
+
+    def test_nothing_is_read_or_uploaded_while_paused(self):
+        app = self.make()
+        calls = []
+        with patch.dict(g.PROVIDERS, {"claude": lambda: calls.append("claude") or usage(),
+                                      "codex": lambda: calls.append("codex") or usage(title="Codex")}):
+            app.toggle_pause()
+            self.assertTrue(app.paused)
+            self.assertIn("en pausa", app._tooltip())
+            self.run_worker_briefly(app)
+        self.assertEqual(calls, [])
+
+    def test_resuming_catches_up_at_once(self):
+        app = self.make()
+        app.paused = True
+        app.toggle_pause()
+        self.assertFalse(app.paused)
+        self.assertTrue(app.wake.is_set())
+        self.assertNotIn("pausa", app._tooltip())
+
+    def test_the_updates_run_normally_when_not_paused(self):
+        app = self.make()
+        calls = []
+        with patch.dict(g.PROVIDERS, {"claude": lambda: calls.append("claude") or usage(),
+                                      "codex": lambda: calls.append("codex") or usage(title="Codex")}):
+            self.run_worker_briefly(app)
+        self.assertIn("claude", calls)
+
+    def test_locking_the_computer_pauses_unless_that_is_turned_off(self):
+        app = self.make()
+        self.assertTrue(app.pause_on_lock)
+        app._set_locked(True)
+        self.assertTrue(app._is_paused())
+        self.assertIn("PC bloqueado", app._tooltip())
+        calls = []
+        with patch.dict(g.PROVIDERS, {"claude": lambda: calls.append("claude") or usage()}):
+            self.run_worker_briefly(app)
+        self.assertEqual(calls, [], "locked: no queries")
+        app.toggle_pause_on_lock()
+        self.assertFalse(app._is_paused(), "locked but 'pause when locked' is off: keeps running")
+        self.assertFalse(self.make().pause_on_lock, "remembered")
+
+    def test_unlocking_wakes_the_loop_and_puts_the_view_back(self):
+        app = self.make()
+        app.slot["claude"] = "a"
+        app._set_locked(True)
+        app.wake.clear()
+        shown = []
+        with patch.object(g, "show_image", side_effect=lambda ip, name: shown.append(name)):
+            app._run_in_background = lambda f, *a: f(*a)
+            app._set_locked(False)
+        self.assertTrue(app.wake.is_set())
+        self.assertEqual(shown, ["claude-usage-a.gif"])
+
+    def test_the_lock_watcher_notices_changes(self):
+        app = self.make()
+        states = iter([False, True, True, False])
+        seen = []
+        real_set = app._set_locked
+
+        def is_locked():
+            try:
+                return next(states)
+            except StopIteration:
+                app.stop.set()
+                return False
+
+        with patch.object(tray.session_lock, "is_locked", side_effect=is_locked), patch.object(tray, "LOCK_POLL", 0.01), \
+                patch.object(app, "_set_locked", side_effect=lambda v: (seen.append(v), real_set(v))):
+            app._watch_lock()
+        self.assertEqual(seen, [True, False])
+
+    # --- brightness, night mode, dimming ---------------------------------------------------------------------
+
+    def sync_background(self, app):
+        app._run_in_background = lambda f, *a: f(*a)
+
+    def test_brightness_is_sent_remembered_and_marked_in_the_menu(self):
+        app = self.make()
+        self.sync_background(app)
+        with patch.object(g, "set_brightness") as send:
+            app.set_brightness(75)
+        send.assert_called_once_with("192.168.1.50", 75)
+        self.assertEqual(app.brightness, 75)
+        self.assertEqual(self.make().brightness, 75, "remembered across restarts")
+
+    def test_a_refused_brightness_changes_nothing(self):
+        app = self.make()
+        with patch.object(g, "set_brightness", side_effect=OSError("device refused")):
+            app.set_brightness(75)
+        self.assertIsNone(app.brightness)
+        self.assertIn("No se pudo cambiar el brillo", self.notes[-1][1])
+
+    def test_night_mode_needs_a_known_day_brightness_first(self):
+        app = self.make()
+        with patch.object(g, "set_night_mode") as send:
+            app.toggle_night()
+        send.assert_not_called()
+        self.assertFalse(app.night["enabled"])
+        self.assertIn("Elige primero tu brillo normal", self.notes[-1][1])
+
+    def test_night_mode_sends_the_schedule_with_the_day_level(self):
+        app = self.make()
+        app.brightness = 60
+        with patch.object(g, "set_night_mode") as send:
+            app.toggle_night()
+            send.assert_called_once_with("192.168.1.50", start_hour=22, end_hour=7, night_level=10, day_level=60, enabled=True)
+            self.assertTrue(app.night["enabled"])
+            app.toggle_night()
+            self.assertFalse(send.call_args.kwargs["enabled"])
+        self.assertFalse(app.night["enabled"])
+
+    def test_night_mode_stays_off_if_the_device_refuses(self):
+        app = self.make()
+        app.brightness = 60
+        with patch.object(g, "set_night_mode", side_effect=OSError("FAIL")):
+            app.toggle_night()
+        self.assertFalse(app.night["enabled"])
+
+    def test_changing_the_day_brightness_keeps_an_enabled_night_schedule_in_step(self):
+        app = self.make()
+        self.sync_background(app)
+        app.brightness, app.night["enabled"] = 60, True
+        with patch.object(g, "set_brightness"), patch.object(g, "set_night_mode") as night:
+            app.set_brightness(30)
+        self.assertEqual(night.call_args.kwargs["day_level"], 30)
+
+    def test_night_label_and_settings_round_trip(self):
+        app = self.make()
+        self.assertEqual(app._night_label(), "Modo nocturno (10 PM - 7 AM, brillo 10 %)")
+        self.assertEqual([tray._hour12(h) for h in (0, 7, 12, 13, 22, 23)], ["12 AM", "7 AM", "12 PM", "1 PM", "10 PM", "11 PM"])
+        app.night.update(enabled=True, start=23, end=6, level=5)
+        app.brightness = 80
+        app._save_state()
+        again = self.make()
+        self.assertEqual((again.night, again.brightness), ({"enabled": True, "start": 23, "end": 6, "level": 5}, 80))
+
+    def test_dim_when_locked_dims_then_restores_the_known_brightness(self):
+        app = self.make()
+        self.sync_background(app)
+        app.brightness = 70
+        with patch.object(g, "set_brightness") as send, patch.object(g, "show_image"):
+            app.toggle_dim_on_lock()
+            self.assertTrue(app.dim_on_lock)
+            app._set_locked(True)
+            app._set_locked(False)
+        self.assertEqual([c.args[1] for c in send.call_args_list], [tray.LOCK_DIM_LEVEL, 70])
+
+    def test_dim_when_locked_refuses_to_guess_the_brightness_to_restore(self):
+        app = self.make()
+        app.toggle_dim_on_lock()
+        self.assertFalse(app.dim_on_lock)
+        self.assertIn("Elige primero tu brillo normal", self.notes[-1][1])
+
+    def test_no_dimming_when_it_is_off_or_there_is_no_device_address(self):
+        app = self.make()
+        self.sync_background(app)
+        app.brightness = 70
+        with patch.object(g, "set_brightness") as send, patch.object(g, "show_image"):
+            app._set_locked(True)  # dim_on_lock is off
+            self.assertEqual(send.call_count, 0)
+            app.dim_on_lock = True
+            app.ip = ""
+            app._set_locked(False)
+            self.assertEqual(send.call_count, 0)
+
+    # --- the stats view ----------------------------------------------------------------------------------------
+
+    def test_the_stats_view_is_a_menu_mode_that_the_click_leaves(self):
+        app = self.make()
+        with patch.object(g, "show_image"):
+            app.toggle_stats()
+            self.assertEqual((app.mode, app._active_key(), app.split), ("stats", "stats", False))
+            self.assertIn("estadísticas", app._tooltip())
+            self.assertEqual(self.make()._active_key(), "stats", "remembered")
+            app.toggle()
+            self.assertEqual((app.mode, app._active_key()), (None, "claude"))
+            app.toggle_stats()
+            app.toggle_split()  # one view of both at a time
+            self.assertEqual(app.mode, "split")
+            app.toggle_stats()
+            app.toggle_stats()
+            self.assertEqual(app.mode, None)
+
+    def test_the_stats_update_uploads_one_still_screen_with_codex_counts(self):
+        app = self.make()
+        app.mode = tray.STATS
+        uploaded, shown = [], []
+        counts = {"24h": {"requests": 26, "sessions": 1}, "7d": {"requests": 1521, "sessions": 17}}
+        with patch.dict(g.PROVIDERS, {"claude": lambda: usage(20, 5), "codex": lambda: usage(10, 5, title="Codex")}), \
+                patch.object(tray.usage_stats, "codex_local_stats", return_value=counts) as scan, \
+                patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append((panels, name))), \
+                patch.object(g, "show_image", side_effect=lambda ip, name: shown.append(name)):
+            self.assertEqual(app._update_panels("stats"), "ok")
+            app._update_panels("stats")  # the next cycle: the counts are not recomputed straight away
+        panels, name = uploaded[0]
+        self.assertEqual((name, shown[0]), ("stats-usage-a.gif", "stats-usage-a.gif"))
+        self.assertEqual([p["title"] for p in panels], ["Claude", "Codex"])
+        self.assertEqual(panels[1]["local_stats"], counts)
+        self.assertNotIn("local_stats", panels[0])
+        self.assertEqual(scan.call_count, 1)
+
+    def test_a_failing_local_count_does_not_break_the_stats_view(self):
+        app = self.make()
+        app.mode = tray.STATS
+        with patch.dict(g.PROVIDERS, {"claude": lambda: usage(20, 5), "codex": lambda: usage(10, 5, title="Codex")}), \
+                patch.object(tray.usage_stats, "codex_local_stats", side_effect=OSError("disk")), \
+                patch.object(g, "push_stats"), patch.object(g, "show_image"):
+            self.assertEqual(app._update_panels("stats"), "ok")
+
+    def test_old_stats_images_are_redrawn_in_the_background_too(self):
+        (self.tmp / "state.json").write_text(json.dumps({"slots": {"stats": "a"}, "render": "old", "view": "claude"}))
+        app = self.make()
+        app.last_good = {p: (usage(title=t), time.monotonic()) for p, t in (("claude", "Claude"), ("codex", "Codex"))}
+        uploaded = []
+        with patch.object(tray.usage_stats, "codex_local_stats", return_value=None), \
+                patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append(name)):
+            app._refresh_outdated_views()
+        self.assertEqual(uploaded, ["stats-usage-b.gif"])
+
+    def test_split_uploads_carry_the_animation_choice(self):
+        app = self.make()
+        app.animation = "coffee"
+        seen = []
+        with patch.object(g, "push_split", side_effect=lambda ip, panels, name, **k: seen.append(k.get("animation"))), \
+                patch.object(g, "show_image"):
+            app._upload("split", {"panels": [usage()]})
+        self.assertEqual(seen, ["coffee"])
+
+    # --- the menu ----------------------------------------------------------------------------------------------
+
+    def test_the_menu_has_every_new_button_in_a_sensible_order(self):
+        app = self.make()
+        top = [item.text for item in app.icon.menu.items if not item.text.startswith("-")]  # (no separators)
+        for wanted in ("Vista dividida", "Estadísticas", "Actualizar ahora", "Pausar", "Pantalla", "Opciones", "Ver logs", "Salir"):
+            self.assertIn(wanted, top)
+        self.assertLess(top.index("Vista dividida"), top.index("Estadísticas"))
+        self.assertLess(top.index("Estadísticas"), top.index("Actualizar ahora"))
+        self.assertLess(top.index("Opciones"), top.index("Ver logs"))
+        sub = {i.text: [s.text for s in i.submenu.items if not s.text.startswith("-")]
+               for i in app.icon.menu.items if i.submenu}
+        self.assertEqual([x for x in sub["Pantalla"] if x.startswith("Brillo")],
+                         [f"Brillo {level} %" for level in tray.DEFAULT_BRIGHTNESS_CHOICES])
+        self.assertIn("Atenuar al bloquear el PC", sub["Pantalla"])
+        self.assertTrue(any(x.startswith("Modo nocturno") for x in sub["Pantalla"]))
+        self.assertEqual(sub["Opciones"], ["Notificaciones", "Pausar al bloquear el PC"])
+
+    def test_night_hours_argument(self):
+        import argparse
+        self.assertEqual(tray.night_hours("22-7"), (22, 7))
+        self.assertEqual(tray.night_hours("0-23"), (0, 23))
+        for bad in ("22", "24-7", "a-b", "22-7-9", "-3-5", ""):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                tray.night_hours(bad)
+
+    def test_night_settings_from_the_command_line_feed_the_menu_item(self):
+        app = tray.App("192.168.1.50", 30, "idle", None, (23, 6), 5)
+        self._alive.append(app)
+        self.assertEqual((app.night["start"], app.night["end"], app.night["level"]), (23, 6, 5))
+        self.assertFalse(app.night["enabled"], "defining the schedule doesn't switch it on")
+        self.assertEqual(app._night_label(), "Modo nocturno (11 PM - 6 AM, brillo 5 %)")
+
+    def test_brightness_menu_items_act_on_their_own_level(self):
+        app = self.make()
+        self.sync_background(app)
+        screen = next(i for i in app.icon.menu.items if i.text == "Pantalla")
+        item = next(i for i in screen.submenu.items if i.text == "Brillo 25 %")
+        with patch.object(g, "set_brightness") as send:
+            item(app.icon)
+        send.assert_called_once_with("192.168.1.50", 25)
+        self.assertTrue(item.checked)
 
     # --- images drawn by older code ------------------------------------------------------------------------
 

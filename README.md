@@ -87,17 +87,23 @@ adds an icon to switch provider.
 | | Windows / Linux | macOS |
 |---|---|---|
 | Switch provider | left-click the icon | click the menu-bar icon, choose Claude or Codex |
-| Menu | right-click: Claude, Codex, Split view, Update now, Notifications, View logs, Quit | same, from the same click |
-| Split view | menu item **Split view** (the click never enters it; it takes you back out) | menu item **Split view** |
+| Menu | right-click (see below) | same, from the same click |
+| Split / stats view | menu items only (the click never enters them; it takes you back out) | menu items |
 
-The menu labels in the app are in Spanish: *Vista dividida* (Split view),
-*Actualizar ahora* (Update now), *Notificaciones*, *Ver logs* and *Salir* (Quit).
+The menu, top to bottom (its labels are in Spanish; the English is in brackets):
+
+- **Claude**, **Codex**: one provider's screen.
+- **Vista dividida** (Split view) and **Estadísticas** (Stats): both providers at once.
+- **Actualizar ahora** (Update now) and **Pausar** (Pause).
+- **Pantalla** (Screen) ▸ brightness levels, **Modo nocturno** (Night mode), **Atenuar al bloquear el PC** (Dim when the PC locks).
+- **Opciones** (Options) ▸ **Notificaciones** (Notifications), **Pausar al bloquear el PC** (Pause when the PC locks).
+- **Ver logs** (View logs) and **Salir** (Quit).
 
 - **Near-instant switching.** Each provider's last image already lives on the
   device (and is remembered across restarts), so a click only changes which one
   is shown; fresh data uploads in the background, and a click cancels any
   upload in flight.
-- **It remembers the view you left** (Claude, Codex or the split view) and comes
+- **It remembers the view you left** (Claude, Codex, split or stats) and comes
   back to it after a restart, a reboot, or the screen coming back online. `--provider`
   only picks the view of the very first run.
 - **Screen off or unreachable?** It retries every ~10 s, and the moment the
@@ -112,11 +118,10 @@ The menu labels in the app are in Spanish: *Vista dividida* (Split view),
 ### Split view
 
 A third screen with **both providers at once**, Claude on top and Codex below,
-each with its mascot, two bars and reset countdowns:
+each with its mascot (doing its own animation, picked at random like on the
+single screens), two bars, reset countdowns and pace:
 
-<img src="docs/preview-split.png" width="480" alt="Split view: normal, with alert colours, and with Claude's panel dimmed because its data is stale">
-
-*Normal, with alert colours (Claude 75 % / 92 %, Codex 96 %), and with Claude's panel dimmed as stale.*
+<img src="docs/preview-split.gif" width="240" alt="Split view: Claude typing on a laptop above, Codex's cloud flashing a lightning bolt below">
 
 It's only turned on from the menu (**Split view**, the checkbox next to Codex), so
 the left-click keeps alternating Claude and Codex. While it's on, the tray icon
@@ -126,6 +131,62 @@ Claude or Codex in the menu leaves it too. Like the other screens it's remembere
 on the device, so turning it on is instant after the first time. If one provider
 can't be read, its panel shows its last numbers dimmed ("! stale since 2:57 PM")
 while the other keeps updating.
+
+### Stats view
+
+A fourth screen, also from the menu (**Estadísticas**), with what each provider
+tells you about your activity:
+
+<img src="docs/preview-stats.png" width="240" alt="Stats view: Claude's requests and sessions with its top skills and subagents; Codex's plan, free resets and local request counts">
+
+- **Claude:** the "Last 24h / Last 7d" blocks that `claude /usage` prints:
+  requests, sessions, and the top skills, subagents and MCP servers.
+- **Codex:** your plan, how many **free rate-limit resets** you still have (and
+  when the next one expires, so you can spend it in time), plus requests and
+  sessions for the last 24 h and 7 days, counted from Codex's local session logs
+  (recomputed every 10 minutes; the first count of a large history takes a second or two).
+
+It's a still image, so it uploads quickly.
+
+### Pace
+
+Under each bar the screens say where you're heading, next to the reset
+countdown: **"~89% at reset"** when you'll make it, or **"Full in 30m"**
+(yellow, red under an hour) when you won't:
+
+<img src="docs/preview-pace.png" width="480" alt="Pace under the bars: ~89% at reset, Full in 30m, Full in 7h 35m, and none while it's too early in the window">
+
+It uses the faster of your average since the window started and your pace over
+the last 30 minutes (6 hours for the week), so a burst of work shows up instead
+of being averaged away. Nothing is shown when it's too early in a window (under
+8 % of it) or almost nothing has been used, and never on stale numbers. Window
+lengths are 5 hours and 7 days; Codex reports its own. Logic: `pace.py`.
+
+### Pause
+
+- **Pausar** stops all querying and uploading until you untick it (not
+  remembered across restarts, so a forgotten pause can't surprise you later).
+- **Pausar al bloquear el PC** (on by default, under **Opciones**) pauses by itself
+  while the computer is locked and catches up the moment you unlock. Lock
+  detection is best effort: Windows asks the desktop, macOS the session
+  (`Quartz`), Linux `loginctl`'s `LockedHint`; if it can't tell, it counts as
+  unlocked. The tooltip says when it's paused and why.
+
+### Screen: brightness and night mode
+
+The device's own backlight, from **Pantalla**:
+
+- **Brillo**: 100, 75, 50, 25, 10 or 0 %. The device takes -10 to 100 but can't
+  say what it's set to, so the app remembers the level it last set.
+- **Modo nocturno**: the device's own night schedule (10 PM - 7 AM at 10 % by
+  default; `--night 23-6` and `--night-brightness 5` change it). Once set the
+  device runs it itself, even with the computer off.
+- **Atenuar al bloquear el PC**: turns the backlight down while the computer is
+  locked and back to your brightness when you unlock.
+
+Night mode and dimming need to restore your normal brightness, which the device
+won't tell us, so they ask you to pick one under **Brillo** first rather than
+guessing and changing it behind your back.
 
 ### Alerts
 
@@ -314,11 +375,15 @@ python -m unittest tests.test_alerts    # one file
 | File | Covers |
 |---|---|
 | `test_alerts.py` | colour thresholds and when notifications fire |
+| `test_pace.py` | pace projection: where a window ends up, when it runs out |
+| `test_usage_stats.py` | Claude's activity blocks, Codex's plan / free resets / local counts |
+| `test_session_lock.py` | screen-lock detection (real here, mocked for macOS / Linux) |
+| `test_brightness.py` | brightness and night mode, against a fake device |
 | `test_codex_usage.py` | the Codex limits query (against a fake `app-server`) |
 | `test_discover.py` | finding the device on the network |
-| `test_render_states.py` | alert colours, stale dimming, 12-hour clock, split view drawing |
+| `test_render_states.py` | alert colours, stale dimming, 12-hour clock, split and stats views, pace on screen |
 | `test_device_errors.py` | a device that cuts responses short is treated as unreachable |
-| `test_tray_logic.py` | tray behaviour: view restore, alerts, stale data, rediscovery, split view, clicks vs uploads |
+| `test_tray_logic.py` | tray behaviour: view restore, alerts, pace history, pause and lock, brightness, stats view, rediscovery, clicks vs uploads |
 
 The tray tests need a desktop session (they build the tray icon objects) and
 skip themselves without one.
