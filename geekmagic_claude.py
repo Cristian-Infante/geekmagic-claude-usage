@@ -251,17 +251,28 @@ def fetch_codex_usage() -> dict:
 
 
 def _codex_extra(limits: dict) -> dict:
-    """Plan, credits and free rate-limit resets, for the stats screen. Every field is optional in Codex's reply."""
-    credits = limits.get("credits") if isinstance(limits.get("credits"), dict) else {}
+    """The free rate-limit resets Codex has granted you, for its own screen: how many are left and in how many days
+    the next one expires. Every field is optional in Codex's reply."""
     resets = limits.get("_reset_credits") if isinstance(limits.get("_reset_credits"), dict) else {}
     available = [c for c in resets.get("credits", []) if isinstance(c, dict) and c.get("status") == "available"]
     expiries = [c["expiresAt"] for c in available if isinstance(c.get("expiresAt"), (int, float))]
     return {
-        "plan": limits.get("planType") if isinstance(limits.get("planType"), str) else None,
-        "credits": "unlimited" if credits.get("unlimited") else (str(credits.get("balance")) if credits.get("hasCredits") else None),
         "free_resets": resets.get("availableCount", len(available)) or 0,
         "next_reset_expires_days": max(0, round((min(expiries) - time.time()) / 86400)) if expiries else None,
     }
+
+
+def _resets_chip(usage: dict) -> tuple[str, str] | None:
+    """(text, colour) for the free-resets note in the corner of Codex's screen: "3 resets · 2d" (days until the
+    next one expires; yellow from 3 days, red from 1 so it gets used in time)."""
+    extra = usage.get("codex_extra") or {}
+    count = extra.get("free_resets")
+    if usage.get("title") != "Codex" or not count:
+        return None
+    days = extra.get("next_reset_expires_days")
+    text = f"{count} reset{'' if count == 1 else 's'}" + (f" · {days}d" if days is not None else "")
+    color = STATE_COLORS["crit"] if days is not None and days <= 1 else STATE_COLORS["warn"] if days is not None and days <= 3 else THEMES["Codex"]["weekly"]
+    return text, color
 
 
 PROVIDERS = {"claude": fetch_usage, "codex": fetch_codex_usage}
@@ -280,7 +291,6 @@ def _parse(text: str) -> dict:
         "weekly_pct": float(week.group(1)) if week else None,
         "weekly_reset": _parse_reset(week.group(2), now) if week and week.group(2) else None,
         "now": now,
-        "stats": usage_stats.parse_claude_stats(text),  # the "Last 24h / Last 7d" activity blocks, for the stats screen
     }
 
 
@@ -752,6 +762,10 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
         extra(image, mascot_w)
 
     draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=title_font, fill=TEXT)
+    chip = _resets_chip(usage)  # Codex only: the free rate-limit resets you still have, top right
+    if chip:
+        text, color = chip
+        draw.text((230 - draw.textlength(text, font=footer_font), 15), text, font=footer_font, fill=color)
 
     _draw_section(
         draw, top=40, label="Session", percent=usage["current_pct"],
@@ -924,13 +938,6 @@ def push_split(
 
 # --- Stats view: activity numbers for both providers ------------------------------------------------------
 
-def stats_lines(usage: dict) -> list[str]:
-    """What a provider's stats panel says (see usage_stats): Claude's activity blocks, Codex's plan and local counts."""
-    if usage.get("title") == "Codex":
-        return usage_stats.codex_lines(usage, usage.get("local_stats"))
-    return usage_stats.claude_lines(usage.get("stats"))
-
-
 def _fit(draw, text: str, font, width: float) -> str:
     """`text` shortened with "..." to fit `width` pixels."""
     if draw.textlength(text, font=font) <= width:
@@ -940,7 +947,41 @@ def _fit(draw, text: str, font, width: float) -> str:
     return text.rstrip() + "..."
 
 
+def _draw_week_chart(draw, days: list[dict], *, left: int, right: int, baseline: int, height: int, color: str, fonts: dict) -> None:
+    """Requests per day for the last week: one bar per day (today's in full colour, earlier days dimmer), the number
+    above each bar and the weekday under it. Scaled to the provider's own busiest day, so the shapes compare."""
+    slot = (right - left) / len(days)
+    top_value = max((d["requests"] for d in days), default=0)
+    dim = _blend(color, BG, 0.45)
+    for i, day in enumerate(days):
+        n = day["requests"]
+        x = left + i * slot
+        bar_w = min(20, slot - 6)
+        x0 = round(x + (slot - bar_w) / 2)
+        h = max(2, round(height * n / top_value)) if top_value and n else 2
+        today = i == len(days) - 1
+        draw.rectangle((x0, baseline - h, x0 + round(bar_w) - 1, baseline - 1), fill=color if today and n else (dim if n else PILL_BG))
+        label = f"{n:,}" if n < 10000 else f"{n // 1000}k"
+        w = draw.textlength(label, font=fonts["tiny"])
+        draw.text((x0 + bar_w / 2 - w / 2, baseline - h - 11), label, font=fonts["tiny"], fill=TEXT if today else MUTED)
+        name = usage_stats.weekday(day["date"])
+        w = draw.textlength(name, font=fonts["tiny"])
+        draw.text((x0 + bar_w / 2 - w / 2, baseline + 1), name, font=fonts["tiny"], fill=TEXT if today else MUTED)
+
+
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _blend(color: str, over: str, amount: float) -> tuple[int, int, int]:
+    """`color` mixed with `over` (0 = all `over`, 1 = all `color`)."""
+    a, b = (tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in (color, over))
+    return tuple(round(b[k] + (a[k] - b[k]) * amount) for k in range(3))
+
+
 def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
+    """One provider's activity: requests and sessions for 24 h and 7 days, and requests per day over the last week.
+    The very same layout and numbers for every provider, so they can be compared at a glance."""
     theme = _theme(usage)
     draw = ImageDraw.Draw(image)
     _draw_mascot(image, (10, top + 8), 2, theme)
@@ -949,9 +990,15 @@ def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) ->
     if not usage.get("stale"):
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
-    for i, line in enumerate(stats_lines(usage)[:5]):
-        draw.text((10, top + 32 + i * 17), _fit(draw, line, fonts["body"], 220), font=fonts["body"],
-                  fill=TEXT if i < 2 else MUTED)
+    activity = usage.get("activity")
+    if not activity:
+        draw.text((10, top + 40), "No local activity logs found" if activity == {} else "Counting...",
+                  font=fonts["body"], fill=MUTED)
+    else:
+        for i, label in enumerate(("24h", "7d")):
+            draw.text((10, top + 28 + i * 15), usage_stats.counts_text(label, activity[label]), font=fonts["body"], fill=TEXT)
+        _draw_week_chart(draw, activity["days"], left=10, right=230, baseline=top + 106, height=34,
+                         color=theme["body"], fonts=fonts)
     if usage.get("stale"):
         box = (0, top, WIDTH, top + SPLIT_PANEL_H)
         image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
@@ -963,7 +1010,7 @@ def _draw_stats_panel(image: Image.Image, top: int, usage: dict, fonts: dict) ->
 def _render_stats_frame(panels: list[dict]) -> Image.Image:
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
     fonts = {"title": ImageFont.load_default(size=17), "body": ImageFont.load_default(size=12),
-             "small": ImageFont.load_default(size=11)}
+             "small": ImageFont.load_default(size=11), "tiny": ImageFont.load_default(size=10)}
     for i, usage in enumerate(panels[:2]):
         _draw_stats_panel(image, i * (SPLIT_PANEL_H + 4), usage, fonts)
     ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)

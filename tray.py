@@ -161,7 +161,8 @@ class App:
         self.mode: str | None = view if view in PANEL_PUSH else None
         # the last single-provider view, also what the left-click toggles from
         self.provider = (self.saved_provider or provider or "claude") if self.mode else view
-        self.local_stats: dict | None = None  # Codex's activity counts from its local logs, see _update_panels
+        # provider -> its activity from its local logs (see usage_stats); {} = it has none, missing = not counted yet
+        self.local_stats: dict[str, dict] = {}
         self.local_stats_at = 0.0
         self.ip = ip or self.saved_ip or ""  # "" until the device is found
         self.cancel = threading.Event()
@@ -732,20 +733,22 @@ class App:
                 continue
             usage, read_at = good
             usage = dict(usage, stale=True) if time.monotonic() - read_at >= STALE_SECONDS else dict(usage)
-            if key == STATS and provider == "codex":
-                usage["local_stats"] = self.local_stats
+            if key == STATS:
+                usage["activity"] = self.local_stats.get(provider)
             panels.append(usage)
         return panels
 
     def _refresh_local_stats(self) -> None:
-        """Codex's activity counts come from its local logs (~90 MB of them): count now and then, not every cycle."""
-        if time.monotonic() - self.local_stats_at < LOCAL_STATS_EVERY and self.local_stats is not None:
+        """Both providers' activity comes from their local logs (~100 MB each): count now and then, not every cycle."""
+        if time.monotonic() - self.local_stats_at < LOCAL_STATS_EVERY and len(self.local_stats) == len(TITLES):
             return
         self.local_stats_at = time.monotonic()
-        try:
-            self.local_stats = usage_stats.codex_local_stats(time.time())
-        except Exception:
-            log.warning("could not count Codex's local activity", exc_info=True)
+        for provider, count in usage_stats.STATS.items():
+            try:
+                stats = count(time.time())
+                self.local_stats[provider] = stats if stats is not None else {}
+            except Exception:
+                log.warning("could not count %s's local activity", provider, exc_info=True)
 
     def _update_panels(self, key: str) -> str:
         """Split / stats view: read both providers (so both get alerts) and upload one screen with the two of them."""

@@ -134,19 +134,31 @@ while the other keeps updating.
 
 ### Stats view
 
-A fourth screen, also from the menu (**Estadísticas**), with what each provider
-tells you about your activity:
+A fourth screen, also from the menu (**Estadísticas**), with your activity for
+both providers. It's the **same numbers, laid out the same way, for each**, so
+you can compare them at a glance:
 
-<img src="docs/preview-stats.png" width="240" alt="Stats view: Claude's requests and sessions with its top skills and subagents; Codex's plan, free resets and local request counts">
+<img src="docs/preview-stats.png" width="240" alt="Stats view: for Claude and for Codex, requests and sessions over 24 hours and 7 days, and a bar chart of requests per day for the last week">
 
-- **Claude:** the "Last 24h / Last 7d" blocks that `claude /usage` prints:
-  requests, sessions, and the top skills, subagents and MCP servers.
-- **Codex:** your plan, how many **free rate-limit resets** you still have (and
-  when the next one expires, so you can spend it in time), plus requests and
-  sessions for the last 24 h and 7 days, counted from Codex's local session logs
-  (recomputed every 10 minutes; the first count of a large history takes a second or two).
+- **24h** and **7d**: requests (model calls) and sessions (conversations).
+- **A bar chart of the last seven days**: requests per day, today highlighted,
+  each provider scaled to its own busiest day (the number is above every bar,
+  so the volumes compare too).
 
-It's a still image, so it uploads quickly.
+Both are counted the same way from each provider's own local log, `~/.claude`
+(or `$CLAUDE_CONFIG_DIR`) for Claude and `~/.codex/sessions` for Codex, and
+cached, recounted every 10 minutes (the first count of a large history takes a
+second or two). For Claude they agree with what `claude /usage` calls "Last
+24h / Last 7d". Only this machine's activity is counted. It's a still image, so
+it uploads quickly. Logic: `usage_stats.py`.
+
+### Codex's free resets
+
+Codex grants free rate-limit resets that expire. Its screen shows how many you
+have left and in how many days the next one expires, top right: **"3 resets ·
+12d"**, yellow from 3 days, red from 1, so one doesn't go to waste. This lives
+on Codex's own screen, not in the stats view, which keeps that one identical
+for both providers.
 
 ### Pace
 
@@ -376,7 +388,7 @@ python -m unittest tests.test_alerts    # one file
 |---|---|
 | `test_alerts.py` | colour thresholds and when notifications fire |
 | `test_pace.py` | pace projection: where a window ends up, when it runs out |
-| `test_usage_stats.py` | Claude's activity blocks, Codex's plan / free resets / local counts |
+| `test_usage_stats.py` | the same activity stats for both providers (counts, sessions, daily chart, cache), Codex's free resets |
 | `test_session_lock.py` | screen-lock detection (real here, mocked for macOS / Linux) |
 | `test_brightness.py` | brightness and night mode, against a fake device |
 | `test_codex_usage.py` | the Codex limits query (against a fake `app-server`) |

@@ -244,15 +244,64 @@ class PaceRenderTests(unittest.TestCase):
 class StatsViewTests(unittest.TestCase):
     TOP, BOTTOM = (0, 0, 240, 118), (0, 122, 240, 240)
 
+    @staticmethod
+    def activity(requests=(5, 0, 12, 30, 8, 22, 40), sessions=4):
+        days = [{"date": f"2026-10-{2 + i:02d}", "requests": n} for i, n in enumerate(requests)]
+        return {"24h": {"requests": requests[-1], "sessions": 1}, "7d": {"requests": sum(requests), "sessions": sessions}, "days": days}
+
     def claude(self, **extra):
-        text = ("Last 24h · 375 requests · 4 sessions\n  Top skills: /pbi 4%\n\n"
-                "Last 7d · 1560 requests · 13 sessions\n  Top subagents: bot-architecture 5%, general-purpose 4%\n")
-        import usage_stats
-        return {**usage(9, 14), "stats": usage_stats.parse_claude_stats(text), **extra}
+        return {**usage(9, 14), "activity": self.activity(), **extra}
 
     def codex(self, **extra):
-        return {**usage(7, 1, title="Codex"), "codex_extra": {"plan": "plus", "free_resets": 3, "next_reset_expires_days": 12, "credits": None},
-                "local_stats": {"24h": {"requests": 26, "sessions": 1}, "7d": {"requests": 1521, "sessions": 17}}, **extra}
+        return {**usage(7, 1, title="Codex"), "activity": self.activity((100, 90, 5, 0, 60, 300, 26), 17), **extra}
+
+    def test_both_panels_have_exactly_the_same_layout(self):
+        frame = g._render_stats_frame([self.claude(), self.codex(activity=self.claude()["activity"])])
+        top, bottom = frame.crop((0, 40, 240, 118)), frame.crop((0, 162, 240, 240))  # everything below each header
+        # same numbers, so the only differences are the providers' colours: the shape of what's drawn is identical
+        shape = lambda im: [(x, y) for y in range(im.height) for x in range(im.width) if im.getpixel((x, y)) != g._hex_rgb(g.BG)]
+        self.assertEqual(shape(top), shape(bottom))
+
+    def test_the_chart_has_a_bar_per_day_and_marks_today(self):
+        panel = self.claude()
+        frame = g._render_stats_frame([panel])
+        crop = (10, 60, 230, 108)
+        dim, bright = g._blend(g.THEMES["Claude"]["body"], g.BG, 0.45), g.THEMES["Claude"]["body"]
+        pixels = list(frame.crop(crop).getdata())
+        self.assertIn(g._hex_rgb(bright), pixels, "today's bar in the full colour")
+        self.assertIn(tuple(dim), pixels, "earlier days dimmer")
+        weekday_names = [s for s in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")]
+        self.assertEqual(len(panel["activity"]["days"]), len(weekday_names))
+
+    def test_the_tallest_day_is_the_tallest_bar_and_empty_days_stay_flat(self):
+        from PIL import ImageDraw
+        canvas = g.Image.new("RGB", (240, 240), g.BG)
+        draw = ImageDraw.Draw(canvas)
+        days = [{"date": f"2026-10-{2 + i:02d}", "requests": n} for i, n in enumerate((0, 10, 100, 50, 0, 25, 100))]
+        fonts = {"tiny": g.ImageFont.load_default(size=10)}
+        g._draw_week_chart(draw, days, left=10, right=230, baseline=100, height=34, color="#FFFFFF", fonts=fonts)
+        bar_colours = {g._hex_rgb("#FFFFFF"), tuple(g._blend("#FFFFFF", g.BG, 0.45)), g._hex_rgb(g.PILL_BG)}
+
+        def bar_height(i):  # walk up from the baseline while the pixels are the bar's (not the number above it)
+            x, y, height = round(10 + i * (220 / 7) + (220 / 7) / 2), 99, 0
+            while canvas.getpixel((x, y)) in bar_colours:
+                height, y = height + 1, y - 1
+            return height
+        heights = [bar_height(i) for i in range(7)]
+        self.assertEqual(heights[2], heights[6], "equal days, equal bars")
+        self.assertGreater(heights[2], heights[3])
+        self.assertGreater(heights[3], heights[5])
+        self.assertGreater(heights[5], heights[1])
+        self.assertLessEqual(heights[0], 3, "a day with no activity is a flat stub")
+
+    def test_the_week_is_scaled_to_the_providers_own_busiest_day(self):
+        quiet = g._render_stats_frame([self.claude(activity=self.activity((1, 1, 2, 1, 1, 1, 2)))])
+        busy = g._render_stats_frame([self.claude(activity=self.activity((100, 100, 200, 100, 100, 100, 200)))])
+        bar = (10, 60, 230, 108)
+        self.assertEqual(quiet.crop(bar).tobytes()[:0], b"")  # (renders)
+        bright = g._hex_rgb(g.THEMES["Claude"]["body"])
+        count = lambda im: sum(1 for p in im.crop(bar).getdata() if p == bright)
+        self.assertAlmostEqual(count(quiet), count(busy), delta=count(busy) * 0.25, msg="same shape whatever the volume")
 
     def test_renders_a_still_gif_with_both_panels(self):
         gif = g.render_stats([self.claude(), self.codex()])
@@ -264,15 +313,25 @@ class StatsViewTests(unittest.TestCase):
         self.assertTrue(has_colour(frame, g.THEMES["Claude"]["body"], self.TOP))
         self.assertTrue(has_colour(frame, g.THEMES["Codex"]["body"], self.BOTTOM))
 
-    def test_text_is_drawn_and_dim_note_lines_differ_from_the_headline_ones(self):
+    def test_the_headline_numbers_are_drawn_in_full_text_colour(self):
         frame = g._render_stats_frame([self.claude(), self.codex()])
-        self.assertTrue(has_similar_colour(frame, g.TEXT, (10, 30, 230, 70), at_least=20), "headline numbers")
-        self.assertTrue(has_similar_colour(frame, g.MUTED, (10, 64, 230, 118), at_least=20), "notes underneath")
+        self.assertTrue(has_similar_colour(frame, g.TEXT, (10, 28, 230, 58), at_least=20), "24h and 7d lines")
+        self.assertTrue(has_similar_colour(frame, g.TEXT, (10, 150, 230, 180), at_least=20), "...in the second panel too")
+
+    def test_it_says_when_it_is_counting_or_when_there_are_no_logs(self):
+        counting = g._render_stats_frame([self.claude(activity=None)])
+        none_found = g._render_stats_frame([self.claude(activity={})])
+        normal = g._render_stats_frame([self.claude()])
+        self.assertNotEqual(counting.tobytes(), none_found.tobytes(), "different messages")
+        self.assertTrue(has_similar_colour(counting, g.MUTED, (10, 36, 230, 62), at_least=10))
+        self.assertFalse(has_colour(counting, g.THEMES["Claude"]["body"], (10, 60, 230, 108)), "no chart without data")
+        self.assertTrue(has_colour(normal, g.THEMES["Claude"]["body"], (10, 60, 230, 108)))
 
     def test_it_copes_with_missing_data(self):
-        g._render_stats_frame([{**usage(1, 1), "stats": None}, {**usage(1, 1, title="Codex"), "codex_extra": {}}])
+        g._render_stats_frame([{**usage(1, 1)}, {**usage(1, 1, title="Codex")}])
         g._render_stats_frame([self.claude()])
         g._render_stats_frame([])
+        g._render_stats_frame([self.claude(activity=self.activity((0, 0, 0, 0, 0, 0, 0)))])  # nothing in a week
 
     def test_a_stale_panel_is_dimmed_and_dated(self):
         fresh = g._render_stats_frame([self.claude(), self.codex()])
@@ -287,11 +346,44 @@ class StatsViewTests(unittest.TestCase):
         from PIL import ImageDraw, ImageFont
         draw = ImageDraw.Draw(g.Image.new("RGB", (240, 240)))
         font = ImageFont.load_default(size=12)
-        long = "Top subagents: " + "bot-architecture 5%, " * 6
-        fitted = g._fit(draw, long, font, 220)
+        fitted = g._fit(draw, "A very long line of text " * 6, font, 220)
         self.assertTrue(fitted.endswith("..."))
         self.assertLessEqual(draw.textlength(fitted, font=font), 220)
         self.assertEqual(g._fit(draw, "short", font, 220), "short")
+
+
+class CodexResetsRenderTests(unittest.TestCase):
+    CHIP_BOX = (130, 10, 232, 32)  # top right of Codex's screen
+
+    def screen(self, title="Codex", **extra):
+        return g._render_frame({**usage(36, 17, title=title), **extra})
+
+    def test_the_chip_shows_on_codex_screen_in_urgency_colours(self):
+        calm = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 12})
+        soon = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 3})
+        today = self.screen(codex_extra={"free_resets": 1, "next_reset_expires_days": 1})
+        self.assertTrue(has_similar_colour(calm, g.THEMES["Codex"]["weekly"], self.CHIP_BOX, at_least=8))
+        self.assertTrue(has_similar_colour(soon, g.STATE_COLORS["warn"], self.CHIP_BOX, at_least=8))
+        self.assertTrue(has_similar_colour(today, g.STATE_COLORS["crit"], self.CHIP_BOX, at_least=8))
+        self.assertFalse(has_similar_colour(calm, g.STATE_COLORS["crit"], self.CHIP_BOX))
+
+    def test_no_chip_without_resets_and_never_on_claude_or_in_the_split_and_stats_views(self):
+        none = self.screen(codex_extra={"free_resets": 0, "next_reset_expires_days": None})
+        plain = self.screen()
+        self.assertEqual(none.crop(self.CHIP_BOX).tobytes(), plain.crop(self.CHIP_BOX).tobytes())
+        claude = self.screen(title="Claude", codex_extra={"free_resets": 3, "next_reset_expires_days": 1})
+        self.assertFalse(has_similar_colour(claude, g.STATE_COLORS["crit"], self.CHIP_BOX))
+        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 1}}
+        split = g._render_split_frame([usage(10, 10), codex])
+        stats = g._render_stats_frame([usage(10, 10), codex])
+        for view in (split, stats):
+            self.assertFalse(has_similar_colour(view, g.STATE_COLORS["crit"], (120, 122, 240, 150)), "resets belong to Codex's own screen")
+
+    def test_the_chip_does_not_collide_with_the_title(self):
+        frame = self.screen(codex_extra={"free_resets": 3, "next_reset_expires_days": 12})
+        title_box = (62, 6, 128, 38)  # where "Codex" is
+        chip_in_title = has_similar_colour(frame, g.THEMES["Codex"]["weekly"], title_box, at_least=1)
+        self.assertFalse(chip_in_title)
 
 
 if __name__ == "__main__":

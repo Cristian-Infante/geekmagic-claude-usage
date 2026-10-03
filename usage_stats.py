@@ -1,137 +1,147 @@
-"""Usage statistics beyond the limits: what `claude /usage` says about your recent activity, and the same kind of
-numbers for Codex (from its account data and its local session logs)."""
+"""Activity statistics, computed the same way for Claude and Codex so the two can be compared.
+
+Both providers keep a local log of what you did with them. Each model call is one *request*, a *session* is a
+conversation, and the numbers are: requests and sessions in the last 24 hours and 7 days, and requests per day for the
+last seven days. (For Claude these agree with what `claude /usage` reports as "Last 24h / Last 7d".)
+"""
 
 from __future__ import annotations
 
+import json
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-_HEADER_RE = re.compile(r"^Last\s+(\w+)\s*·\s*([\d,]+)\s+requests?(?:\s*·\s*([\d,]+)\s+sessions?)?", re.IGNORECASE)
+DAYS = 7  # days in the chart: today and the six before it
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+CODEX_DIR = Path.home() / ".codex" / "sessions"
+
 _TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+Event = tuple  # (epoch seconds, session key, unique id of the request or None)
+_cache: dict[str, tuple[float, int, list[Event]]] = {}  # path -> (mtime, size, events)
 
 
-def _int(text: str | None) -> int | None:
-    return int(text.replace(",", "")) if text else None
+def _epoch(text: str) -> float | None:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
-def _counts(requests: int | None, sessions: int | None) -> str:
-    """"375 requests · 4 sessions" (singular for 1, thousands separators)."""
-    parts = []
-    if requests is not None:
-        parts.append(f"{requests:,} request{'' if requests == 1 else 's'}")
-    if sessions is not None:
-        parts.append(f"{sessions} session{'' if sessions == 1 else 's'}")
-    return " · ".join(parts)
+def _claude_events(path: Path) -> list[Event]:
+    """Every model call in one Claude Code log: an `assistant` entry with token usage. A reply written in several
+    blocks repeats its message id, so ids are what get counted. The session is the entry's own sessionId (sub-agents
+    log under their parent's)."""
+    found = []
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"usage"' not in line or '"assistant"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            message = entry.get("message")
+            if entry.get("type") != "assistant" or not isinstance(message, dict) or "usage" not in message:
+                continue
+            when = _epoch(entry.get("timestamp") or "")
+            if when is not None:
+                found.append((when, entry.get("sessionId") or path.stem, message.get("id") or entry.get("uuid")))
+    return found
 
 
-def parse_claude_stats(text: str) -> dict | None:
-    """The "Last 24h / Last 7d" blocks of `claude /usage`:
-    {"windows": [{"label": "24h", "requests": 375, "sessions": 4, "notes": ["89% of your usage was at ..."]}]}.
-    None if the text has none (the format is Claude Code's to change, so this is deliberately forgiving)."""
-    windows: list[dict] = []
-    current: dict | None = None
-    for line in text.splitlines():
-        header = _HEADER_RE.match(line.strip()) if not line.startswith((" ", "\t")) else None
-        if header:
-            current = {"label": header.group(1), "requests": _int(header.group(2)), "sessions": _int(header.group(3)), "notes": []}
-            windows.append(current)
-        elif current is not None and line.startswith((" ", "\t")) and line.strip():
-            current["notes"].append(line.strip())
-        elif not line.strip() or not line.startswith((" ", "\t")):
-            current = None
-    return {"windows": windows} if windows else None
+def _codex_events(path: Path) -> list[Event]:
+    """Every model call in one Codex session log: a `token_count` event that carries token info."""
+    found = []
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"token_count"' not in line or '"info":null' in line.replace(" ", ""):
+                continue
+            match = _TIMESTAMP_RE.search(line)
+            when = _epoch(match.group(1)) if match else None
+            if when is not None:
+                found.append((when, path.stem, None))
+    return found
 
 
-def _short(note: str) -> str:
-    """"89% of your usage was at >150k context" -> "89% of usage at >150k context"."""
-    return (note.replace("of your usage was at", "of usage at").replace("of your usage came from", "of usage from")
-            .replace("your ", ""))
-
-
-def claude_lines(stats: dict | None, limit: int = 5) -> list[str]:
-    """The lines for Claude's stats panel: one per window, then the most telling notes."""
-    if not stats:
-        return ["No activity stats in /usage"]
-    lines = []
-    for w in stats["windows"]:
-        lines.append(f"{w['label']} · {_counts(w['requests'], w['sessions'])}")
-    notes = [_short(n) for w in stats["windows"] for n in w["notes"]]
-    notes.sort(key=lambda n: (not n.startswith("Top"), ))  # "Top skills/subagents" first: they say the most
-    return (lines + notes)[:limit]
-
-
-def codex_lines(usage: dict, local: dict | None, limit: int = 5) -> list[str]:
-    """The lines for Codex's panel: plan and free resets (from the API) plus local request/session counts."""
-    extra = usage.get("codex_extra") or {}
-    lines = []
-    plan = extra.get("plan")
-    if plan:
-        credits = extra.get("credits")
-        lines.append(f"Plan: {plan.title()}" + (" · unlimited credits" if credits == "unlimited" else
-                                                  f" · credits {credits}" if credits else ""))
-    free = extra.get("free_resets")
-    if free:
-        days = extra.get("next_reset_expires_days")
-        lines.append(f"Free resets: {free}" + (f" · next expires in {days}d" if days is not None else ""))
-    for label in ("24h", "7d"):
-        counts = (local or {}).get(label)
-        if counts is None:
-            lines.append(f"{label} · counting...")
-        else:
-            lines.append(f"{label} · {_counts(counts['requests'], counts['sessions'])}")
-    return lines[:limit]
-
-
-# --- Codex local activity ------------------------------------------------------------------------------
-
-_cache: dict[str, tuple[float, int, list[float]]] = {}  # path -> (mtime, size, request epochs)
-
-
-def _epochs(path: Path, mtime: float, size: int) -> list[float]:
-    """Epoch seconds of every model call (a `token_count` event) in one session log. Finished logs never change,
-    so each is read once; only a log that grew since last time is read again."""
+def _events(path: Path, mtime: float, size: int, reader) -> list[Event]:
+    """A finished log never changes, so each is read once; only one that grew since last time is read again."""
     cached = _cache.get(str(path))
     if cached and cached[0] == mtime and cached[1] == size:
         return cached[2]
-    found: list[float] = []
     try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"token_count"' not in line or '"info":null' in line.replace(" ", ""):
-                    continue
-                match = _TIMESTAMP_RE.search(line)
-                if match:
-                    try:
-                        found.append(datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp())
-                    except ValueError:
-                        pass
+        found = reader(path)
     except OSError:
         return []
     _cache[str(path)] = (mtime, size, found)
     return found
 
 
-def codex_local_stats(now_epoch: float, sessions_dir: Path | None = None) -> dict | None:
-    """{"24h": {"requests": n, "sessions": n}, "7d": {...}} from Codex's local session logs, or None if there are none.
-    Requests are model calls; a session is a log that saw activity in the window."""
-    root = sessions_dir or CODEX_SESSIONS
-    if not root.is_dir():
-        return None
-    windows = {"24h": 24 * 3600, "7d": 7 * 24 * 3600}
-    totals = {label: {"requests": 0, "sessions": 0} for label in windows}
+def collect(root: Path, reader, now_epoch: float) -> list[Event]:
+    """The events of every log under `root` recent enough to matter for the chart."""
+    oldest = _start_of_day(now_epoch, DAYS - 1)
+    events: list[Event] = []
     for path in root.rglob("*.jsonl"):
         try:
             stat = path.stat()
         except OSError:
             continue
-        if now_epoch - stat.st_mtime > windows["7d"]:
-            continue
-        epochs = _epochs(path, stat.st_mtime, stat.st_size)
-        for label, span in windows.items():
-            count = sum(1 for t in epochs if now_epoch - t <= span)
-            if count:
-                totals[label]["requests"] += count
-                totals[label]["sessions"] += 1
-    return totals
+        if stat.st_mtime >= oldest:  # a log untouched since before the chart began has nothing in it
+            events.extend(_events(path, stat.st_mtime, stat.st_size, reader))
+    return events
+
+
+def _start_of_day(epoch: float, days_ago: int) -> float:
+    day = datetime.fromtimestamp(epoch).date() - timedelta(days=days_ago)
+    return datetime(day.year, day.month, day.day).timestamp()
+
+
+def summarize(events: list[Event], now_epoch: float) -> dict:
+    """{"24h": {"requests", "sessions"}, "7d": {...}, "days": [{"date", "requests"}] oldest first, 7 entries}."""
+    seen: set = set()
+    unique: list[Event] = []
+    for event in sorted(events):
+        key = (event[1], event[2]) if event[2] is not None else (event[0], event[1], len(unique))
+        if key not in seen:
+            seen.add(key)
+            unique.append(event)
+    windows = {"24h": 24 * 3600, "7d": 7 * 24 * 3600}
+    summary: dict = {}
+    for label, span in windows.items():
+        inside = [e for e in unique if now_epoch - e[0] <= span]
+        summary[label] = {"requests": len(inside), "sessions": len({e[1] for e in inside})}
+    today = datetime.fromtimestamp(now_epoch).date()
+    counts = {today - timedelta(days=n): 0 for n in range(DAYS - 1, -1, -1)}
+    for when, _, _ in unique:
+        day = datetime.fromtimestamp(when).date()
+        if day in counts:
+            counts[day] += 1
+    summary["days"] = [{"date": day.isoformat(), "requests": n} for day, n in counts.items()]
+    return summary
+
+
+def claude_stats(now_epoch: float, root: Path | None = None) -> dict | None:
+    root = root or CLAUDE_DIR
+    return summarize(collect(root, _claude_events, now_epoch), now_epoch) if root.is_dir() else None
+
+
+def codex_stats(now_epoch: float, root: Path | None = None) -> dict | None:
+    root = root or CODEX_DIR
+    return summarize(collect(root, _codex_events, now_epoch), now_epoch) if root.is_dir() else None
+
+
+STATS = {"claude": claude_stats, "codex": codex_stats}
+
+
+# --- text for the screen ------------------------------------------------------------------------------
+
+def counts_text(label: str, counts: dict) -> str:
+    """"24h · 375 requests · 4 sessions" (singular for 1, thousands separators)."""
+    r, s = counts["requests"], counts["sessions"]
+    return f"{label} · {r:,} request{'' if r == 1 else 's'} · {s} session{'' if s == 1 else 's'}"
+
+
+def weekday(date_text: str) -> str:
+    """"2026-10-02" -> "Fr" (English, whatever the system language)."""
+    return ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")[datetime.fromisoformat(date_text).weekday()]

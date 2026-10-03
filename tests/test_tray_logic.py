@@ -649,13 +649,27 @@ class TrayLogicTests(unittest.TestCase):
             app.toggle_stats()
             self.assertEqual(app.mode, None)
 
-    def test_the_stats_update_uploads_one_still_screen_with_codex_counts(self):
+    ACTIVITY = {
+        "claude": {"24h": {"requests": 422, "sessions": 4}, "7d": {"requests": 1584, "sessions": 13},
+                   "days": [{"date": f"2026-09-{26 + i}", "requests": i} for i in range(7)]},
+        "codex": {"24h": {"requests": 26, "sessions": 1}, "7d": {"requests": 1521, "sessions": 17},
+                  "days": [{"date": f"2026-09-{26 + i}", "requests": 10 * i} for i in range(7)]},
+    }
+
+    def fake_counts(self, **overrides):
+        """Replace how each provider's local activity is counted; returns the call log."""
+        calls = []
+        counters = {p: (lambda now, p=p: calls.append(p) or self.ACTIVITY[p]) for p in tray.TITLES}
+        counters.update(overrides)
+        return calls, patch.dict(tray.usage_stats.STATS, counters)
+
+    def test_the_stats_update_uploads_one_still_screen_with_both_providers_activity(self):
         app = self.make()
         app.mode = tray.STATS
         uploaded, shown = [], []
-        counts = {"24h": {"requests": 26, "sessions": 1}, "7d": {"requests": 1521, "sessions": 17}}
+        calls, counting = self.fake_counts()
         with patch.dict(g.PROVIDERS, {"claude": lambda: usage(20, 5), "codex": lambda: usage(10, 5, title="Codex")}), \
-                patch.object(tray.usage_stats, "codex_local_stats", return_value=counts) as scan, \
+                counting, \
                 patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append((panels, name))), \
                 patch.object(g, "show_image", side_effect=lambda ip, name: shown.append(name)):
             self.assertEqual(app._update_panels("stats"), "ok")
@@ -663,25 +677,53 @@ class TrayLogicTests(unittest.TestCase):
         panels, name = uploaded[0]
         self.assertEqual((name, shown[0]), ("stats-usage-a.gif", "stats-usage-a.gif"))
         self.assertEqual([p["title"] for p in panels], ["Claude", "Codex"])
-        self.assertEqual(panels[1]["local_stats"], counts)
-        self.assertNotIn("local_stats", panels[0])
-        self.assertEqual(scan.call_count, 1)
+        self.assertEqual([p["activity"] for p in panels], [self.ACTIVITY["claude"], self.ACTIVITY["codex"]],
+                         "the same kind of numbers for both")
+        self.assertEqual(sorted(calls), ["claude", "codex"], "each counted once, not once per cycle")
 
-    def test_a_failing_local_count_does_not_break_the_stats_view(self):
+    def test_the_counts_come_back_after_their_interval(self):
+        app = self.make()
+        calls, counting = self.fake_counts()
+        with counting:
+            app._refresh_local_stats()
+            app._refresh_local_stats()
+            self.assertEqual(len(calls), 2)
+            app.local_stats_at -= tray.LOCAL_STATS_EVERY + 1
+            app._refresh_local_stats()
+        self.assertEqual(len(calls), 4)
+
+    def test_a_failing_count_does_not_break_the_stats_view(self):
         app = self.make()
         app.mode = tray.STATS
+        uploaded = []
+
+        def broken(now):
+            raise OSError("disk")
+
+        calls, counting = self.fake_counts(codex=broken)
         with patch.dict(g.PROVIDERS, {"claude": lambda: usage(20, 5), "codex": lambda: usage(10, 5, title="Codex")}), \
-                patch.object(tray.usage_stats, "codex_local_stats", side_effect=OSError("disk")), \
-                patch.object(g, "push_stats"), patch.object(g, "show_image"):
+                counting, patch.object(g, "show_image"), \
+                patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append(panels)):
             self.assertEqual(app._update_panels("stats"), "ok")
+        claude, codex = uploaded[0]
+        self.assertEqual(claude["activity"], self.ACTIVITY["claude"])
+        self.assertIsNone(codex["activity"], "no numbers yet: the screen says it's counting")
+
+    def test_a_provider_without_logs_is_marked_as_having_none(self):
+        app = self.make()
+        calls, counting = self.fake_counts(claude=lambda now: None)
+        with counting:
+            app._refresh_local_stats()
+        self.assertEqual(app.local_stats["claude"], {})
+        self.assertEqual(app.local_stats["codex"], self.ACTIVITY["codex"])
 
     def test_old_stats_images_are_redrawn_in_the_background_too(self):
         (self.tmp / "state.json").write_text(json.dumps({"slots": {"stats": "a"}, "render": "old", "view": "claude"}))
         app = self.make()
         app.last_good = {p: (usage(title=t), time.monotonic()) for p, t in (("claude", "Claude"), ("codex", "Codex"))}
         uploaded = []
-        with patch.object(tray.usage_stats, "codex_local_stats", return_value=None), \
-                patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append(name)):
+        calls, counting = self.fake_counts()
+        with counting, patch.object(g, "push_stats", side_effect=lambda ip, panels, name, **k: uploaded.append(name)):
             app._refresh_outdated_views()
         self.assertEqual(uploaded, ["stats-usage-b.gif"])
 
