@@ -34,11 +34,13 @@ class TrayLogicTests(unittest.TestCase):
             patch.object(g, "list_images", return_value=set()),
             patch.object(g, "delete_image"),
             patch.object(tray, "BACKGROUND_STATS", False),  # count the activity inline so tests are deterministic
+            # notifications are recorded (title, message), not sent; the system-route backup is recorded apart
+            patch.object(tray.notifier, "send", side_effect=lambda title, message: self.backups.append((title, message)) or True),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        self.notes = []
+        self.notes, self.backups = [], []
         g._recent_animations.clear()
 
     _alive = []  # pystray registers a Windows window class per icon object; keep them from being recycled
@@ -90,7 +92,24 @@ class TrayLogicTests(unittest.TestCase):
     def test_a_failing_notification_backend_never_breaks_the_loop(self):
         app = self.make()
         app.icon.notify = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no toast support"))
-        app._check_alerts("claude", usage(current=96))  # must not raise
+        with patch.object(tray.notifier, "send", return_value=False):  # the system's route fails too
+            app._check_alerts("claude", usage(current=96))  # must not raise
+        with patch.object(tray.notifier, "send", side_effect=OSError("helper exploded")):
+            app._check_alerts("codex", usage(current=96, title="Codex"))  # nor must this
+
+    def test_each_alert_is_shown_once_by_the_tray_and_the_system_route_is_only_a_backup(self):
+        app = self.make()
+        app._notify("Claude", "hola")
+        self.assertEqual((self.notes, self.backups), ([("Claude", "hola")], []), "one notification, never two")
+        app.icon.notify = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no balloon here"))
+        app._notify("Claude", "otra vez")
+        self.assertEqual(self.backups, [("Claude", "otra vez")], "the tray couldn't: the system's own route steps in")
+
+    def test_turned_off_notifications_send_nothing_at_all(self):
+        app = self.make()
+        app.toggle_notifications()
+        app._notify("Claude", "hola")
+        self.assertEqual((self.notes, self.backups), ([], []))
 
     # --- stale data -----------------------------------------------------------------------------------
 
@@ -753,7 +772,7 @@ class TrayLogicTests(unittest.TestCase):
                          [f"Brillo {level} %" for level in tray.DEFAULT_BRIGHTNESS_CHOICES])
         self.assertIn("Atenuar al bloquear el PC", sub["Pantalla"])
         self.assertTrue(any(x.startswith("Modo nocturno") for x in sub["Pantalla"]))
-        self.assertEqual(sub["Opciones"], ["Notificaciones", "Avisar cuando un agente termine", "Pausar al bloquear el PC"])
+        self.assertEqual(sub["Opciones"], ["Notificaciones", "Avisar cuando un agente termine o te espere", "Pausar al bloquear el PC"])
         self.assertEqual(sub["Más vistas"], ["Proyectos y modelos", "Horas pico"])
 
     def test_night_hours_argument(self):
@@ -914,10 +933,8 @@ class TrayLogicTests(unittest.TestCase):
         app._agent_update("codex", self.state(False, project="Storefront"))
         app._agent_update("codex", self.state(False, project="Storefront"))
         title, message = self.notes[-1]
-        self.assertEqual(title, "Codex")
-        self.assertIn("Terminó", message)
-        self.assertIn("4 min", message)
-        self.assertIn("Storefront", message)
+        self.assertEqual(title, "Codex · Storefront", "the project is in the title, the first thing you read")
+        self.assertEqual(message, "Terminó (trabajó 4 min)")
 
     def test_short_runs_finish_without_a_notification(self):
         app = self.make()
@@ -944,6 +961,178 @@ class TrayLogicTests(unittest.TestCase):
         for _ in range(2):
             app._agent_update("claude", self.state(False))
         self.assertIn("15 min", self.notes[-1][1])
+
+    # --- an agent waiting for you ----------------------------------------------------------------------------
+
+    def waiting(self, reason="question", project="Acme App", since=None):
+        return {**self.state(True, since=since or time.time() - 100, project=project), "waiting": True, "waiting_for": reason}
+
+    def test_waiting_is_only_believed_after_two_polls_in_a_row(self):
+        app = self.make()
+        app._agent_update("claude", self.waiting())
+        self.assertFalse(app._waiting("claude"), "one poll could be a flicker")
+        self.assertEqual(self.notes, [])
+        self.assertTrue(app._working("claude"))
+        app._agent_update("claude", self.state(True, since=time.time() - 100))  # it moved on: the streak starts over
+        app._agent_update("claude", self.waiting())
+        self.assertFalse(app._waiting("claude"))
+        app._agent_update("claude", self.waiting())
+        self.assertTrue(app._waiting("claude"))
+        self.assertEqual(len(self.notes), 1)
+
+    def test_the_notification_says_what_it_is_waiting_for_and_where(self):
+        cases = (("question", "Te hizo una pregunta"), ("plan", "Espera que apruebes su plan"),
+                 ("approval (Edit)", "Espera tu aprobación (Edit)"), ("approval", "Espera tu aprobación"),
+                 ("something new", "Espera tu respuesta"))
+        for reason, expected in cases:
+            app = self.make()
+            self.notes.clear()
+            for _ in range(2):
+                app._agent_update("claude", self.waiting(reason))
+            self.assertEqual(self.notes[-1], ("Claude · Acme App", expected), "the project is in the title")
+        app = self.make()
+        self.notes.clear()
+        for _ in range(2):
+            app._agent_update("codex", self.waiting("question", project=None))
+        self.assertEqual(self.notes[-1], ("Codex", "Te hizo una pregunta"), "without a project, just the provider")
+
+    def test_waiting_flags_a_redraw_and_shows_in_the_tooltip(self):
+        app = self.make()
+        app.agent_dirty = False
+        for _ in range(2):
+            app._agent_update("codex", self.waiting("approval"))
+        self.assertTrue(app.agent_dirty)
+        self.assertIn("Codex te espera", app._tooltip())
+        self.assertNotIn("trabajando", app._tooltip())
+
+    def test_answering_clears_it_and_redraws_but_it_keeps_working(self):
+        app = self.make()
+        for _ in range(2):
+            app._agent_update("claude", self.waiting())
+        app.agent_dirty = False
+        self.notes.clear()
+        app._agent_update("claude", self.state(True, since=time.time() - 100))
+        self.assertFalse(app._waiting("claude"))
+        self.assertTrue(app._working("claude"))
+        self.assertTrue(app.agent_dirty)
+        self.assertEqual(self.notes, [], "no notification for being answered")
+        self.assertIn("Claude trabajando", app._tooltip())
+
+    def test_one_notification_per_wait_not_one_per_poll(self):
+        app = self.make()
+        for _ in range(10):
+            app._agent_update("claude", self.waiting())
+        self.assertEqual(len(self.notes), 1)
+
+    def test_it_can_be_silenced_with_the_same_option_as_the_finished_notification(self):
+        app = self.make()
+        app.notify_done = False
+        for _ in range(3):
+            app._agent_update("claude", self.waiting())
+        self.assertEqual(self.notes, [])
+        self.assertTrue(app._waiting("claude"), "the screen still shows it")
+
+    def test_waiting_then_finishing_still_reports_the_whole_run(self):
+        app = self.make()
+        app._agent_update("claude", self.waiting(since=time.time() - 600))
+        app._agent_update("claude", self.waiting(since=time.time() - 600))
+        self.notes.clear()
+        for _ in range(2):
+            app._agent_update("claude", self.state(False))
+        self.assertIn("10 min", self.notes[-1][1])
+        self.assertFalse(app._waiting("claude"))
+
+    def test_the_flag_reaches_what_gets_drawn(self):
+        app = self.make()
+        for _ in range(2):
+            app._agent_update("claude", self.waiting())
+        single = app._flag_working("claude", usage())
+        self.assertEqual((single["working"], single["waiting"]), (True, True))
+        other = app._flag_working("codex", usage(title="Codex"))
+        self.assertEqual((other["working"], other["waiting"]), (False, False))
+        panels = app._flag_working("split", {"panels": [usage(), usage(title="Codex")]})["panels"]
+        self.assertEqual([(p["working"], p["waiting"]) for p in panels], [(True, True), (False, False)])
+
+    # --- several projects at once ---------------------------------------------------------------------------
+
+    def session(self, sid, project, working=True, waiting=False, reason=None, since=None):
+        return {"id": sid, "project": project, "working": working, "waiting": waiting, "waiting_for": reason,
+                "since": since or time.time() - 300, "last": time.time()}
+
+    def overall(self, *sessions):
+        """What agent_activity reports: the overall state plus every session."""
+        lead = next((s for s in sessions if s["waiting"]), next((s for s in sessions if s["working"]), sessions[0]))
+        return {**{k: v for k, v in lead.items() if k != "id"}, "sessions": list(sessions)}
+
+    def test_each_project_is_followed_and_notified_on_its_own(self):
+        app = self.make()
+        alpha, beta = self.session("A", "Alpha"), self.session("B", "Beta")
+        app._agent_update("claude", self.overall(alpha, beta))
+        self.assertEqual(app.agent["claude"]["sessions"], 2)
+        beta_asks = {**beta, "waiting": True, "reason": "question", "waiting_for": "question"}
+        for _ in range(2):
+            app._agent_update("claude", self.overall(alpha, beta_asks))
+        self.assertEqual(self.notes, [("Claude · Beta", "Te hizo una pregunta")], "it says which project is asking")
+        self.assertTrue(app._waiting("claude"))
+
+    def test_two_projects_asking_at_once_each_get_their_own_notification(self):
+        app = self.make()
+        asking = lambda sid, project: {**self.session(sid, project), "waiting": True, "waiting_for": "question"}
+        for _ in range(3):
+            app._agent_update("claude", self.overall(asking("A", "Alpha"), asking("B", "Beta")))
+        self.assertEqual(sorted(self.notes), [("Claude · Alpha", "Te hizo una pregunta"), ("Claude · Beta", "Te hizo una pregunta")])
+
+    def test_one_project_finishing_is_reported_while_another_keeps_working(self):
+        app = self.make()
+        alpha, beta = self.session("A", "Alpha", since=time.time() - 400), self.session("B", "Beta", since=time.time() - 50)
+        app._agent_update("claude", self.overall(alpha, beta))
+        alpha_done = {**alpha, "working": False, "waiting": False, "since": None}
+        for _ in range(2):
+            app._agent_update("claude", self.overall(alpha_done, beta))
+        self.assertEqual(self.notes, [("Claude · Alpha", "Terminó (trabajó 6 min)")])
+        self.assertTrue(app._working("claude"), "Beta is still going: the screen keeps saying so")
+        self.assertEqual(app.agent["claude"]["sessions"], 1)
+        self.assertEqual(app.agent["claude"]["project"], "Beta")
+
+    def test_the_last_one_finishing_clears_the_indicator(self):
+        app = self.make()
+        alpha = self.session("A", "Alpha", since=time.time() - 400)
+        app._agent_update("claude", self.overall(alpha))
+        done = {**alpha, "working": False, "since": None}
+        for _ in range(2):
+            app._agent_update("claude", self.overall(done))
+        self.assertFalse(app._working("claude"))
+        self.assertEqual(len(self.notes), 1)
+
+    def test_a_session_that_disappears_counts_as_finished(self):
+        app = self.make()
+        app._agent_update("claude", self.overall(self.session("A", "Alpha", since=time.time() - 200)))
+        idle = {"working": False, "waiting": False, "waiting_for": None, "since": None, "last": None, "project": None, "sessions": []}
+        for _ in range(2):
+            app._agent_update("claude", idle)
+        self.assertFalse(app._working("claude"))
+        self.assertEqual(self.notes, [("Claude · Alpha", "Terminó (trabajó 3 min)")])
+        self.assertEqual(app.tracks["claude"], {}, "forgotten once idle and gone")
+
+    def test_the_needier_project_leads_the_summary_the_screens_use(self):
+        app = self.make()
+        working = self.session("A", "Alpha")
+        asking = {**self.session("B", "Beta"), "waiting": True, "waiting_for": "plan"}
+        for _ in range(2):
+            app._agent_update("claude", self.overall(working, asking))
+        summary = app.agent["claude"]
+        self.assertEqual((summary["waiting"], summary["waiting_for"], summary["project"]), (True, "plan", "Beta"))
+
+    def test_sessions_of_the_two_providers_do_not_mix(self):
+        app = self.make()
+        app._agent_update("claude", self.overall(self.session("S", "Same")))
+        app._agent_update("codex", self.overall(self.session("S", "Same")))
+        self.assertEqual((app.agent["claude"]["sessions"], app.agent["codex"]["sessions"]), (1, 1))
+        done = {**self.session("S", "Same"), "working": False}
+        for _ in range(2):
+            app._agent_update("codex", self.overall(done))
+        self.assertTrue(app._working("claude"))
+        self.assertFalse(app._working("codex"))
 
     def test_polling_reads_both_agents_and_survives_a_failure(self):
         app = self.make()

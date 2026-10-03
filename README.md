@@ -181,9 +181,13 @@ until it's done.
 
 ### Agent activity
 
-The screens tell you when Claude Code or Codex is **working right now**, and the
-tray tells you when one that had been busy a while **finishes**, so you can walk
-away from a long run:
+The screens tell you when Claude Code or Codex is **working right now** or has
+stopped and is **waiting for you**, and the tray tells you when one that had
+been busy a while **finishes**, so you can walk away from a long run. It follows
+**each session on its own**, so if you work in several projects at once, every
+notification says which one:
+
+<img src="docs/preview-agent-states.png" width="720" alt="The split, stats and projects views and a single screen, with a green 'Working' tag or an amber 'Waiting' tag beside the clock">
 
 <table>
 <tr>
@@ -192,20 +196,34 @@ away from a long run:
 </tr>
 </table>
 
-- **While it works:** a green dot ("Working" on the single screens, a dot by the
-  clock on the others) and the mascot switches to a working animation (Claude at
-  its laptop, Codex typing brackets) instead of the random one. The tray's
-  tooltip says it too.
-- **When it finishes:** a notification like "Terminó (trabajó 4 min en Acme App)",
-  but only for runs of a minute or more, and only once it has stayed quiet for a
-  few seconds, so the gaps between its steps don't count. It also works while
-  the PC is locked or paused, which is exactly when you'd want to hear it. Turn it
-  off under **Opciones**.
+- **While it works:** a green **Working** tag (a dot and the word, by the clock)
+  and the mascot switches to a working animation (Claude at its laptop, Codex
+  typing brackets) instead of the random one. The tray's tooltip says it too.
+- **While it waits for you:** an amber **Waiting** tag and a different animation
+  (Claude has an idea, Codex sparkles), plus a notification titled with the
+  project: **"Claude · Acme App" — "Te hizo una pregunta"**, or "Espera que
+  apruebes su plan", or "Espera tu aprobación (Edit)". It stays up for as long
+  as it's waiting, even if you were away for an hour.
+- **When it finishes:** **"Claude · Acme App" — "Terminó (trabajó 4 min)"**, but
+  only for runs of a minute or more. It also works while the PC is locked or
+  paused, which is exactly when you'd want to hear it. The wait and finish
+  notifications are one switch under **Opciones** (*Avisar cuando un agente
+  termine o te espere*).
+- **Several projects at once:** each session is tracked separately (a session's
+  sub-agents count as part of it), so one finishing is reported while another is
+  still going, and two asking at the same time each get their own notification.
 - **How it knows:** both tools keep writing a local log. Claude Code's ends in a
   finished reply (`end_turn`) when it is done and in a tool call or a tool result
-  while it works; Codex marks each turn `task_started` / `task_complete`. A log
-  that goes quiet is treated as abandoned after a while (2 minutes, or 10 while a
-  tool runs). Logic: `agent_activity.py`.
+  while it works. It is **waiting** when a tool call has no result and that tool
+  only waits on a person: `AskUserQuestion` and `ExitPlanMode` at once, or a tool
+  that normally returns in milliseconds (`Read`, `Edit`, `Write`, `Grep`...) that
+  has been pending 20 seconds, which means it's waiting for you to allow it. A
+  long `Bash` command looks the same from the log as a permission prompt, so it's
+  never taken for waiting. Codex marks each turn `task_started` /
+  `task_complete`, and a pending approval or question request counts as waiting
+  (best effort: not verified against a real approval, and not every setup records
+  them). A log that goes quiet is treated as abandoned after a while. Polled every
+  2 seconds. Logic: `agent_activity.py`.
 
 ### Codex's free resets
 
@@ -266,6 +284,15 @@ guessing and changing it behind your back.
   (the hidden one is read every 2 minutes). Each alert fires once, also across
   restarts. Turn them off from the menu (**Notifications**); the choice is remembered.
   Thresholds live in `alerts.py`.
+- **How notifications are sent.** Each alert is shown **once**, by the tray app
+  itself (the one Windows lists as "Python"). Only if that fails does the
+  system's own route (`notifier.py`: a PowerShell toast on Windows, `osascript`
+  on macOS, `notify-send` on Linux) step in as a backup; sending both made every
+  alert appear twice. The backup's text travels in environment variables, never
+  inside a command. `GEEKMAGIC_NO_NOTIFY=1` turns that backup off (the tests use it).
+- **One copy at a time.** The tray app holds a lock file (`tray.lock`) while it
+  runs; a second copy exits right away instead of fighting over the screen and
+  doubling the notifications.
 
 <img src="docs/preview-states.png" width="480" alt="Normal, yellow (75%), red (96%) and dimmed stale screens, for Claude and Codex">
 
@@ -444,7 +471,10 @@ python -m unittest tests.test_alerts    # one file
 |---|---|
 | `test_alerts.py` | colour thresholds and when notifications fire |
 | `test_pace.py` | pace projection: where a window ends up, when it runs out |
-| `test_agent_activity.py` | deciding from the logs whether Claude / Codex is working right now |
+| `test_agent_activity.py` | deciding from the logs whether Claude / Codex is working, waiting for you or idle, per session |
+| `test_notifier.py` | the system-route backup per OS, and that nothing in the text can break (or inject into) the command |
+| `test_single_instance.py` | a second copy can't start while the first runs, and the lock frees up afterwards |
+| `test_response_times.py` | small-but-identical GIFs, one request to show an image, parallel reads, start-up order |
 | `test_usage_stats.py` | the same activity stats for both providers (counts, sessions, daily chart, cache), Codex's free resets |
 | `test_session_lock.py` | screen-lock detection (real here, mocked for macOS / Linux) |
 | `test_brightness.py` | brightness and night mode, against a fake device |
@@ -472,12 +502,49 @@ docs don't cover it:
 | Free space | `GET /space.json` |
 
 Animated GIFs are decoded and looped **on the device itself** — one upload per
-push, no per-frame network traffic. The device handles one request at a time
-and takes ~35 ms per KB to store a file (a ~80 KB GIF keeps it busy for about
-3 s), which is why the tray app uploads each provider into two alternating
-files (`<provider>-usage-a.gif` / `-b.gif`) and switches providers with just a
-`/set?img=` call. Keep GIFs well under the device's free space
-(`/space.json`); these run 25–95 KB.
+push, no per-frame network traffic. The device handles one request at a time,
+answers each in ~0.3 s and stores an upload at ~25–45 ms per KB plus ~0.8 s
+fixed, which is why the tray app uploads each view into two alternating files
+(`<view>-usage-a.gif` / `-b.gif`) and switches views with just a `/set?img=`
+call. Keep GIFs well under the device's free space (`/space.json`); these run
+3–25 KB (see [Response times](#response-times)). `/set` answers `OK`, or `FAIL`
+for what it doesn't know or can't find.
+
+## Response times
+
+Where the time goes, measured on a real SmallTV, and what was done about it:
+
+| | Before | Now |
+|---|---|---|
+| Show a stored image (every click) | 0.6 s (two requests) | **0.3 s** (one) |
+| Upload a single-screen GIF | 2.4 s (51 KB) | **1.4 s** (10 KB) |
+| Upload a working / animated GIF | 4.2 s (117 KB) | **1.4 s** (15 KB) |
+| Upload the split view | 4.3 s (122 KB) | **1.6 s** (22 KB) |
+| Read both providers (split view cycle) | 4.3 s one after the other | **3.4 s** in parallel |
+| An agent starts working → the screen says so | up to ~10 s | **~3-4 s** |
+| An agent finishes → the screen says so | ~15 s | **~6-8 s** |
+| Start-up → remembered view on screen | after searching and listing files (~1.5 s) | **first**, in one request |
+
+(The two agent rows are worked out from the polling interval, the quiet period
+that has to pass before a run counts as over, and the measured upload times; the
+rest were timed on a real device. Finishing takes longer than starting on purpose:
+four quiet seconds in a row are needed, so the gaps between an agent's steps
+don't flicker the screen or send a notification too early.)
+
+- **Frame-difference GIFs.** The screens are static except for a mascot, so each
+  frame after the first is stored as just the rectangle that changed
+  (`disposal=1`): 5-10x smaller, and decoded to exactly the same frames (there's
+  a test). The device takes most of an update's time just storing the file, so
+  this is the big one.
+- **One request to show an image.** The Photo Album theme is only selected the
+  first time, or again if the device ever refuses an image.
+- **Parallel reads.** A view of both providers waits for the slower read (Claude's
+  `/usage`, ~3.5 s) instead of both added up (Codex's is ~1 s).
+- **Quicker agent detection.** Polled every 2 s from cached per-log summaries (a log
+  that hasn't changed isn't read again), and a start or stop is redrawn from the
+  readings already in hand instead of querying again.
+- **Cancel, don't queue.** A click aborts an upload in flight, and no background
+  upload starts for a few seconds after one, so a click never waits behind one.
 
 ## Why this exists / prior art
 

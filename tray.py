@@ -36,8 +36,10 @@ import alerts
 import autostart
 import discover
 import geekmagic_claude as g
+import notifier
 import pace
 import session_lock
+import single_instance
 import usage_stats
 
 # Identifies the code that draws the screens. The device keeps the images it was sent, so after an update (new
@@ -47,6 +49,8 @@ RENDER_ID = hashlib.sha1(b"".join(
 )).hexdigest()[:12]
 
 LOG_PATH = Path(__file__).with_name("tray.log")
+LOCK_PATH = Path(__file__).with_name("tray.lock")  # held by the running app, see single_instance
+_instance_lock = None
 STATE_PATH = Path(__file__).with_name("tray_state.json")  # remembered between runs, see App._load_state
 log = logging.getLogger("tray")
 
@@ -71,8 +75,9 @@ PAUSE_POLL = 5  # while paused, how often the worker looks again
 LOCAL_STATS_EVERY = 600  # the providers' local activity counts are refreshed at most this often (seconds)
 LOCAL_STATS_RETRY = 60  # ...or this often while one of them is still missing (it failed)
 BACKGROUND_STATS = True  # count in a thread (the first count of a month of logs takes seconds); tests turn it off
-AGENT_POLL = 5  # seconds between looks at whether an agent is working
+AGENT_POLL = 2  # seconds between looks at whether an agent is working (a read of a few log tails: cheap)
 AGENT_IDLE_POLLS = 2  # polls in a row that must say "idle" before a run counts as finished (no flapping)
+AGENT_WAIT_POLLS = 2  # polls in a row that must say "waiting for you" before it's shown and notified
 AGENT_MIN_RUN = 60  # a run shorter than this (seconds) ends without a notification
 HISTORY_MAX = 150  # readings kept per usage window, for the recent-pace estimate
 HISTORY_EVERY = {"current": 300, "weekly": 1800}  # ...adding one at least this often (seconds), or when the % changed
@@ -184,11 +189,11 @@ class App:
         self.locked = False
         self.notify_done = True  # tell me when an agent that has been working a while finishes
         self.agent: dict[str, dict] = {}  # provider -> latest agent_activity state (is it working right now?)
-        self.agent_project: dict[str, str | None] = {}  # ...and what it's working on, kept for the "finished" note
-        self.run_started: dict[str, float] = {}  # provider -> when its current run began
-        self.idle_polls: dict[str, int] = {}  # polls in a row that said idle, for a run that was working
+        # provider -> session id -> what's known of that session (see _track_session): one per project you work in
+        self.tracks: dict[str, dict[str, dict]] = {}
         self.agent_dirty = False  # an agent started or stopped: redraw from what's already read
         self._counting = False  # the local activity counts are being computed in a thread
+        self._shown_failed = False  # the last attempt to put a remembered image on screen didn't get through
         self.outdated: set[str] = set()  # views whose stored image was drawn by an older version of the code
         self.slot: dict[str, str] = self._load_state()  # provider -> "a"/"b", the complete image on the device
         if night_hours:  # --night START-END / --night-brightness: the schedule the menu's night mode will use
@@ -215,6 +220,8 @@ class App:
         self.offline = False  # the device didn't answer on the last attempt
         self.offline_since: float | None = None
         self.push_lock = threading.Lock()
+        # Guards the readings, history, alerts and the state file: the two providers are read in parallel threads.
+        self._data_lock = threading.RLock()
         self.wake = threading.Event()
         self.stop = threading.Event()
         self.icon = pystray.Icon(
@@ -242,7 +249,7 @@ class App:
                 )),
                 pystray.MenuItem("Opciones", pystray.Menu(
                     pystray.MenuItem("Notificaciones", self.toggle_notifications, checked=lambda _: self.notify_enabled),
-                    pystray.MenuItem("Avisar cuando un agente termine", self.toggle_notify_done, checked=lambda _: self.notify_done),
+                    pystray.MenuItem("Avisar cuando un agente termine o te espere", self.toggle_notify_done, checked=lambda _: self.notify_done),
                     pystray.MenuItem("Pausar al bloquear el PC", self.toggle_pause_on_lock, checked=lambda _: self.pause_on_lock),
                 )),
                 pystray.MenuItem("Ver logs", self.open_logs),
@@ -265,9 +272,10 @@ class App:
 
     def _tooltip(self) -> str:
         view = VIEW_NAMES[self.mode] if self.mode else f"mostrando {TITLES[self.provider]}"
-        busy = [TITLES[p] for p in TITLES if self.agent.get(p, {}).get("working")]
-        if busy:
-            view += " · " + " y ".join(busy) + " trabajando"
+        notes = [f"{TITLES[p]} te espera" if self._waiting(p) else f"{TITLES[p]} trabajando"
+                 for p in TITLES if self._working(p)]
+        if notes:
+            view += " · " + " y ".join(notes)
         if self.paused:
             return f"GeekMagic: {view} (en pausa)"
         if self.pause_on_lock and self.locked:
@@ -309,6 +317,10 @@ class App:
             return {}
 
     def _save_state(self) -> None:
+        with self._data_lock:
+            self._write_state()
+
+    def _write_state(self) -> None:
         state = {
             "slots": self.slot, "animations": g._recent_animations, "ip": self.ip or None,
             "alerts": self.alerts, "notify": self.notify_enabled,
@@ -437,33 +449,83 @@ class App:
             self._agent_update(provider, state)
 
     def _agent_update(self, provider: str, state: dict) -> None:
-        """Follow one agent. A run starting shows at once; one ending is only believed after AGENT_IDLE_POLLS quiet
-        polls in a row, so the gaps between its steps don't make the screen flicker or notify too early."""
-        was = bool(self.agent.get(provider, {}).get("working"))
-        if state["working"]:
-            self.idle_polls[provider] = 0
-            self.agent_project[provider] = state.get("project")
-            self.agent[provider] = state
-            if not was:
-                self.run_started[provider] = state.get("since") or time.time()
-                log.info("%s started working (%s)", provider, state.get("project"))
-                self._agent_changed()
-            return
-        if not was:
-            self.agent[provider] = state
-            return
-        self.idle_polls[provider] = self.idle_polls.get(provider, 0) + 1
-        if self.idle_polls[provider] < AGENT_IDLE_POLLS:
-            return
-        self.agent[provider] = state
-        started = self.run_started.pop(provider, None)
-        lasted = time.time() - started if started else 0
-        log.info("%s finished (worked %s)", provider, agent_activity.duration_text(lasted))
-        if self.notify_done and lasted >= AGENT_MIN_RUN:
-            project = self.agent_project.get(provider)
-            self._notify(TITLES[provider], f"Terminó (trabajó {agent_activity.duration_text(lasted)}"
-                                           + (f" en {project})" if project else ")"))
-        self._agent_changed()
+        """Follow a provider's agents, one session at a time (you may be working in several projects at once, and
+        each one's run starts, asks you something and finishes on its own). Without a list of sessions the whole
+        state is treated as a single one. The screens only need the sum: is any of them working / waiting?"""
+        sessions = state["sessions"] if "sessions" in state else [{**state, "id": "-"}]  # (an empty list is "none")
+        tracks = self.tracks.setdefault(provider, {})
+        seen = {s.get("id") or "-" for s in sessions}
+        changed = False
+        for s in sessions:
+            changed |= self._track_session(provider, s.get("id") or "-", s, tracks)
+        for gone in [sid for sid in tracks if sid not in seen]:  # its log went quiet for good: it can only be idle
+            changed |= self._track_session(provider, gone, {"working": False, "waiting": False}, tracks)
+        for idle in [sid for sid, t in tracks.items() if not t["working"]]:
+            del tracks[idle]  # an idle session needs no memory: the debounce counters only matter while it works
+        busy = [t for t in tracks.values() if t["working"]]
+        waiting = [t for t in busy if t["waiting"]]
+        lead = (waiting or busy or [{}])[0]  # the one that needs you, else any that works (for the screens' summary)
+        self.agent[provider] = {
+            "working": bool(busy), "waiting": bool(waiting), "waiting_for": lead.get("waiting_for") if waiting else None,
+            "project": lead.get("project") if busy else state.get("project"), "since": min((t["started"] for t in busy), default=None),
+            "sessions": len(busy),
+        }
+        if changed:
+            self._agent_changed()
+
+    def _track_session(self, provider: str, sid: str, s: dict, tracks: dict) -> bool:
+        """One session: a run starting shows at once; a question is believed after AGENT_WAIT_POLLS polls in a row and
+        a run ending after AGENT_IDLE_POLLS quiet ones, so the gaps between its steps don't flicker or notify early.
+        Returns whether something visible changed."""
+        t = tracks.setdefault(sid, {"working": False, "waiting": False, "waiting_for": None, "started": None,
+                                    "idle_polls": 0, "wait_polls": 0, "project": None})
+        if s.get("project"):
+            t["project"] = s["project"]
+        changed = False
+        if s.get("working"):
+            t["idle_polls"] = 0
+            if not t["working"]:
+                t.update(working=True, started=s.get("since") or time.time())
+                log.info("%s started working (%s)", provider, t["project"])
+                changed = True
+            t["wait_polls"] = t["wait_polls"] + 1 if s.get("waiting") else 0
+            waiting_now = bool(s.get("waiting")) and (t["waiting"] or t["wait_polls"] >= AGENT_WAIT_POLLS)
+            if waiting_now != t["waiting"]:
+                t["waiting"], t["waiting_for"] = waiting_now, (s.get("waiting_for") if waiting_now else None)
+                log.info("%s (%s) %s", provider, t["project"],
+                         f"is waiting for you ({t['waiting_for']})" if waiting_now else "is no longer waiting for you")
+                if waiting_now:
+                    self._notify_waiting(provider, t)
+                changed = True
+        elif t["working"]:
+            t["idle_polls"] += 1
+            if t["idle_polls"] >= AGENT_IDLE_POLLS:
+                lasted = time.time() - t["started"] if t["started"] else 0
+                log.info("%s (%s) finished (worked %s)", provider, t["project"], agent_activity.duration_text(lasted))
+                if self.notify_done and lasted >= AGENT_MIN_RUN:
+                    self._notify(self._agent_title(provider, t["project"]), f"Terminó (trabajó {agent_activity.duration_text(lasted)})")
+                t.update(working=False, waiting=False, waiting_for=None, started=None, wait_polls=0)
+                changed = True
+        return changed
+
+    @staticmethod
+    def _agent_title(provider: str, project: str | None) -> str:
+        """"Claude · Acme App": the project is in the title, which is what you read first when you have several going."""
+        return f"{TITLES[provider]} · {project}" if project else TITLES[provider]
+
+    def _notify_waiting(self, provider: str, session: dict) -> None:
+        """It stopped and needs you: say what for (a question, a plan to approve, a tool to allow); the title says where."""
+        reason = session.get("waiting_for") or ""
+        if reason == "question":
+            what = "Te hizo una pregunta"
+        elif reason == "plan":
+            what = "Espera que apruebes su plan"
+        elif reason.startswith("approval"):
+            what = "Espera tu aprobación" + reason[len("approval"):]  # "approval (Edit)" -> "...aprobación (Edit)"
+        else:
+            what = "Espera tu respuesta"
+        if self.notify_done:
+            self._notify(self._agent_title(provider, session.get("project")), what)
 
     def _agent_changed(self) -> None:
         """Redraw with (or without) the working indicator, from the readings we already have."""
@@ -654,13 +716,17 @@ class App:
     def _working(self, provider: str | None) -> bool:
         return bool(provider and self.agent.get(provider, {}).get("working"))
 
+    def _waiting(self, provider: str | None) -> bool:
+        return bool(provider and self.agent.get(provider, {}).get("waiting"))
+
     def _flag_working(self, key: str, usage: dict) -> dict:
         """What's about to be drawn, with each provider's "its agent is working right now" flag set from the latest
         look at its logs (the screen draws a green dot and the mascot works)."""
         if key in TITLES:
-            return {**usage, "working": self._working(key)}
+            return {**usage, "working": self._working(key), "waiting": self._waiting(key)}
         if key in PANEL_PUSH:
-            return {**usage, "panels": [{**p, "working": self._working(PROVIDER_OF.get(p.get("title")))}
+            return {**usage, "panels": [{**p, "working": self._working(PROVIDER_OF.get(p.get("title"))),
+                                         "waiting": self._waiting(PROVIDER_OF.get(p.get("title")))}
                                         for p in usage["panels"]]}
         return usage
 
@@ -691,8 +757,13 @@ class App:
             with self.push_lock:
                 if key == self._active_key():
                     g.show_image(self.ip, slot_file(key, slot))
+                    self._shown_failed = False
                     log.info("showed %s", key)
+        except OSError as e:  # the device not answering is routine (it's off, or being searched for)
+            self._shown_failed = True
+            log.warning("could not show %s: %s", key, e)
         except Exception:
+            self._shown_failed = True
             log.exception("show failed (%s)", key)
 
     def _mark_offline(self, reason: object) -> None:
@@ -758,11 +829,12 @@ class App:
                 self.icon.title = f"GeekMagic: {e}"[:120]
             self._mark_stale(provider)
             return None
-        self._record_history(provider, usage)
-        pace.annotate(usage, self._recent_rates(provider, usage))  # the pace that goes under each bar
-        self.last_good[provider] = (usage, time.monotonic())
-        self.stale.discard(provider)
-        self._check_alerts(provider, usage)
+        with self._data_lock:  # (the slow part, the read itself, was above and ran unlocked)
+            self._record_history(provider, usage)
+            pace.annotate(usage, self._recent_rates(provider, usage))  # the pace that goes under each bar
+            self.last_good[provider] = (usage, time.monotonic())
+            self.stale.discard(provider)
+            self._check_alerts(provider, usage)
         return usage
 
     def _record_history(self, provider: str, usage: dict) -> None:
@@ -828,8 +900,13 @@ class App:
         if not self.notify_enabled:
             return
         try:
-            self.icon.notify(message, title)
-        except Exception:  # not every platform/backend supports it, and it must never break the update loop
+            try:
+                self.icon.notify(message, title)  # the tray app's own notification (the one shown as "Python")
+                return
+            except Exception:
+                log.warning("the tray's own notification failed; trying the system's", exc_info=True)
+            notifier.send(title, message)  # backup only: sending both would show every alert twice
+        except Exception:  # it must never break the update loop
             log.warning("could not show the notification", exc_info=True)
 
     def _refresh_other(self, provider: str) -> None:
@@ -893,14 +970,22 @@ class App:
         """A view of both providers: read both (so both get alerts) and upload one screen with the two of them.
         `refetch=False` redraws from the readings we already have (only an agent started or stopped)."""
         if refetch:
-            for provider in TITLES:
-                self._fetch_usage(provider)
+            self._fetch_all()
         if key in STATS_VIEWS:
             self._refresh_local_stats()
         panels = self._panels(key)
         if not panels:
             return "error"
         return self._deliver(key, {"panels": panels})
+
+    def _fetch_all(self) -> None:
+        """Read both providers at the same time (Claude's `/usage` takes ~3.5 s, Codex's ~1 s): a view of both waits
+        for the slower one instead of for the two added up."""
+        threads = [threading.Thread(target=self._fetch_usage, args=(provider,), daemon=True) for provider in TITLES]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     def _update_split(self) -> str:
         return self._update_panels(SPLIT)
@@ -932,9 +1017,12 @@ class App:
 
     def worker(self) -> None:
         pending: tuple[str, dict, float] | None = None  # (provider, usage, read at) awaiting delivery
+        if self.ip:  # the remembered view goes up first, in one request: it needs neither the search nor the file list
+            self._show_uploaded(self._active_key())
         self._resolve_device()
         self._sync_with_device()
-        self._show_uploaded(self._active_key())  # the remembered view up right away, before the first (slow) refresh
+        if not self.slot.get(self._active_key()) or self._shown_failed:
+            self._show_uploaded(self._active_key())  # (the address changed, or the first try didn't get through)
         while not self.stop.is_set():
             self.wake.clear()
             # An upload keeps the device busy for seconds; wait out rapid toggling so a click never queues behind it.
@@ -1024,6 +1112,12 @@ def main() -> None:
             *(["--night", f"{args.night[0]}-{args.night[1]}"] if args.night else []),
             *(["--night-brightness", str(args.night_brightness)] if args.night_brightness is not None else []),
         ]))
+        return
+    try:
+        global _instance_lock  # kept for as long as the app runs: the lock goes with it
+        _instance_lock = single_instance.acquire(LOCK_PATH)
+    except single_instance.AlreadyRunning:
+        print("The tray app is already running; not starting a second copy.", file=sys.stderr)
         return
     setup_logging()
     App(args.ip, args.interval, args.animation, args.provider, args.night, args.night_brightness).run()

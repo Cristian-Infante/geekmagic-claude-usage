@@ -585,6 +585,63 @@ class WorkingIndicatorTests(unittest.TestCase):
     def test_the_working_animations_exist(self):
         for title, name in g.WORKING_ANIMATION.items():
             self.assertIn(name, g.ANIMATION_GROUPS[title])
+        for title, name in g.WAITING_ANIMATION.items():
+            self.assertIn(name, g.ANIMATION_GROUPS[title])
+
+
+class WaitingIndicatorTests(unittest.TestCase):
+    AMBER = g._hex_rgb(g.WAITING_COLOR)
+
+    def screen(self, **extra):
+        return g._render_frame({**usage(36, 17), **extra})
+
+    def test_waiting_shows_an_amber_badge_instead_of_the_green_one(self):
+        box = (140, 4, 234, 28)
+        waiting = self.screen(working=True, waiting=True)
+        self.assertTrue(has_similar_colour(waiting, g.WAITING_COLOR, box, at_least=15))
+        self.assertFalse(has_similar_colour(waiting, g.WORKING_COLOR, box), "not green as well")
+        self.assertTrue(has_similar_colour(self.screen(working=True), g.WORKING_COLOR, box, at_least=15))
+
+    def test_the_two_badges_say_different_words(self):
+        self.assertEqual(g._busy_style({"working": True}), ("Working", g.WORKING_COLOR))
+        self.assertEqual(g._busy_style({"working": True, "waiting": True}), ("Waiting", g.WAITING_COLOR))
+        self.assertIsNone(g._busy_style({}))
+        self.assertIsNone(g._busy_style({"working": False, "waiting": False}))
+
+    def test_waiting_wins_the_animation_too(self):
+        self.assertEqual(g._busy_animation({"title": "Claude", "working": True}), "typing")
+        self.assertEqual(g._busy_animation({"title": "Claude", "working": True, "waiting": True}), "eureka")
+        self.assertEqual(g._busy_animation({"title": "Codex", "working": True, "waiting": True}), "sparkle")
+        self.assertIsNone(g._busy_animation({"title": "Codex"}))
+
+    def test_every_view_shows_the_amber_dot(self):
+        dots = lambda im, box: sum(1 for p in im.crop(box).getdata() if p == self.AMBER)
+        waiting = {**usage(9, 14), "working": True, "waiting": True, "activity": sample_activity()}
+        idle = {**waiting, "working": False, "waiting": False}
+        for name, render, box in (("stats", g._render_stats_frame, (150, 4, 232, 30)),
+                                  ("breakdown", g._render_breakdown_frame, (150, 4, 232, 30)),
+                                  ("hours", g._render_hours_frame, (150, 4, 232, 30)),
+                                  ("split", g._render_split_frame, (150, 4, 232, 34))):
+            self.assertGreater(dots(render([waiting, idle]), box), 10, name)
+            self.assertEqual(dots(render([idle, idle]), box), 0, name)
+
+    def test_pushing_uses_the_waiting_animation_and_leaves_the_rotation_alone(self):
+        from unittest.mock import patch
+        g._recent_animations.clear()
+        with patch.object(g, "upload"), patch.object(g, "render_animation", wraps=g.render_animation) as render:
+            g.push_usage("x", {**usage(9, 14), "working": True, "waiting": True}, "auto")
+        self.assertEqual(render.call_args.args[1], "eureka")
+        self.assertEqual(g._recent_animations, {})
+        with patch.object(g, "upload"), patch.object(g, "render_split", wraps=g.render_split) as split:
+            g.push_split("x", [{**usage(9, 14), "working": True, "waiting": True}, {**usage(7, 1, title="Codex")}], "s.gif")
+        self.assertEqual(split.call_args.args[1][0], "eureka")
+        self.assertEqual(list(g._recent_animations), ["Codex"], "only the idle panel counts for the rotation")
+
+    def test_the_codex_resets_chip_still_fits_under_the_waiting_badge(self):
+        codex = {**usage(36, 17, title="Codex"), "codex_extra": {"free_resets": 3, "next_reset_expires_days": 12},
+                 "working": True, "waiting": True}
+        screen = g._render_frame(codex)
+        self.assertTrue(has_similar_colour(screen, g.THEMES["Codex"]["weekly"], (140, 21, 234, 38), at_least=8))
 
 
 class CodexResetsRenderTests(unittest.TestCase):

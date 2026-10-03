@@ -762,11 +762,13 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
         extra(image, mascot_w)
 
     draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=title_font, fill=TEXT)
-    working = bool(usage.get("working"))  # its agent is running right now: a green "Working" top right
-    if working:
-        label_w = draw.textlength("Working", font=footer_font)
-        draw.text((230 - label_w, 7), "Working", font=footer_font, fill=WORKING_COLOR)
-        _draw_working_dot(draw, 230 - label_w - 11, 15)
+    busy = _busy_style(usage)  # its agent is running (green "Working") or waiting for you (amber "Waiting"), top right
+    working = busy is not None
+    if busy:
+        label, color = busy
+        label_w = draw.textlength(label, font=footer_font)
+        draw.text((230 - label_w, 7), label, font=footer_font, fill=color)
+        _draw_working_dot(draw, 230 - label_w - 11, 15, color)
     chip = _resets_chip(usage)  # Codex only: the free rate-limit resets you still have, top right
     if chip:
         text, color = chip
@@ -821,9 +823,12 @@ def _encode_gif(frames: list[Image.Image]) -> bytes:
     base = sheet.quantize(colors=96)
     quantized = [f.quantize(palette=base) for f in frames]
     buf = BytesIO()
+    # disposal=1 ("leave the frame in place") lets each frame after the first be stored as just the rectangle that
+    # changed: the screens are static except for a mascot, so the GIFs shrink 5-10x (a 118 KB split view is 22 KB).
+    # The device takes ~36 ms per KB to store an upload, so this is most of the time an update used to take.
     quantized[0].save(
         buf, format="GIF", save_all=True, append_images=quantized[1:],
-        duration=130, loop=0, disposal=2, optimize=False,
+        duration=130, loop=0, disposal=1, optimize=False,
     )
     return buf.getvalue()
 
@@ -878,8 +883,7 @@ def _draw_split_panel(image: Image.Image, top: int, usage: dict, frame: tuple, f
     if not usage.get("stale"):
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 12), updated, font=fonts["small"], fill=theme["current"])
-        if usage.get("working"):
-            _draw_working_dot(draw, 230 - width - 11, top + 19)
+        _draw_busy_tag(draw, top + 25, usage, fonts["small"])
     for row_top, label, window, accent in (
         (top + 40, "Session", "current", theme["current"]),
         (top + 77, "Weekly", "weekly", theme["weekly"]),
@@ -926,8 +930,8 @@ def _animation_for(usage: dict, requested: str) -> str:
     random one from its own set (never one of its last three)."""
     title = usage.get("title", "Claude")
     group = ANIMATION_GROUPS.get(title, ANIMATION_GROUPS["Claude"])
-    if usage.get("working") and requested in ("auto", "random"):
-        return WORKING_ANIMATION.get(title, "idle")  # its agent is busy: the mascot works too
+    if _busy_animation(usage) and requested in ("auto", "random"):
+        return _busy_animation(usage)  # its agent is busy: the mascot works (or asks for you) too
     return requested if requested in group else _pick_animation(usage)
 
 
@@ -992,13 +996,52 @@ def _blend(color: str, over: str, amount: float) -> tuple[int, int, int]:
 
 
 WORKING_COLOR = "#4ADE80"  # the dot (and word) that says an agent is running right now
+WAITING_COLOR = "#FFB020"  # ...and amber when it has stopped and is waiting for you
 WORKING_ANIMATION = {"Claude": "typing", "Codex": "code"}  # what each mascot does while its agent works
+WAITING_ANIMATION = {"Claude": "eureka", "Codex": "sparkle"}  # ...and while it waits for you (an idea! / sparkles)
 
 
-def _draw_working_dot(draw, x: float, y: float) -> None:
-    """A small green dot with a halo: "this agent is working", in the corner of a panel header."""
-    draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=_blend(WORKING_COLOR, BG, 0.3))
-    draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=WORKING_COLOR)
+def _busy_style(usage: dict) -> tuple[str, str] | None:
+    """(label, colour) of the badge for an agent that is waiting for you or working, else None. Waiting wins."""
+    if usage.get("waiting"):
+        return "Waiting", WAITING_COLOR
+    if usage.get("working"):
+        return "Working", WORKING_COLOR
+    return None
+
+
+def _busy_animation(usage: dict) -> str | None:
+    """What the mascot does while its agent is busy (None when it isn't)."""
+    title = usage.get("title", "Claude")
+    if usage.get("waiting"):
+        return WAITING_ANIMATION.get(title, "idle")
+    if usage.get("working"):
+        return WORKING_ANIMATION.get(title, "idle")
+    return None
+
+
+def _draw_working_dot(draw, x: float, y: float, color: str = WORKING_COLOR) -> None:
+    """A small dot with a halo: "this agent is busy" (green) or "is waiting for you" (amber), in a panel header."""
+    draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=_blend(color, BG, 0.3))
+    draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+
+
+def _draw_busy_tag(draw, y: float, usage: dict, font, left_of: float | None = None) -> None:
+    """In a panel header, the dot and its word ("Working" / "Waiting"). A dot alone is easy to miss on a small screen;
+    the word makes it unmistakable. By default it's right-aligned on the line under the clock (the split view's
+    header is crowded: beside the clock it ran into the provider's name); with `left_of` it sits just left of that x
+    instead, for headers with room. Nothing if the agent isn't busy."""
+    busy = _busy_style(usage)
+    if not busy:
+        return
+    label, color = busy
+    width = draw.textlength(label, font=font)
+    if left_of is None:
+        _draw_working_dot(draw, 230 - width - 11, y + 7, color)
+        draw.text((230 - width, y), label, font=font, fill=color)
+    else:
+        _draw_working_dot(draw, left_of - 8, y + 7, color)
+        draw.text((left_of - 16 - width, y), label, font=font, fill=color)
 
 
 def _draw_panel_header(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
@@ -1011,8 +1054,7 @@ def _draw_panel_header(image: Image.Image, top: int, usage: dict, fonts: dict) -
         updated = _clock(usage["now"])
         width = draw.textlength(updated, font=fonts["small"])
         draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
-        if usage.get("working"):
-            _draw_working_dot(draw, 230 - width - 11, top + 17)
+        _draw_busy_tag(draw, top + 10, usage, fonts["small"], left_of=230 - width)
 
 
 def _dim_stale_panel(image: Image.Image, top: int, usage: dict, fonts: dict) -> None:
@@ -1302,11 +1344,25 @@ def delete_image(ip: str, filename: str) -> None:
     urllib.request.urlopen(f"http://{ip}/delete?file=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
 
 
+_theme_ready: set[str] = set()  # devices this process has already put on the Photo Album theme
+
+
 @_device_errors
 def show_image(ip: str, filename: str) -> None:
-    """Pin an already-uploaded image on screen (fast: no file transfer)."""
-    urllib.request.urlopen(f"http://{ip}/set?theme=3", timeout=CONNECT_TIMEOUT).read()
-    urllib.request.urlopen(f"http://{ip}/set?img=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
+    """Pin an already-uploaded image on screen. One request (~0.3 s, the device is slow): the Photo Album theme is
+    only selected the first time, or again if the device ever refuses the image (the theme was changed on the
+    device itself, or it restarted)."""
+    try:
+        if ip not in _theme_ready:
+            _device_set(ip, "theme=3")
+            _theme_ready.add(ip)
+        if _device_reply(ip, f"img=/image/{filename}") != "OK":
+            _device_set(ip, "theme=3")
+            if _device_reply(ip, f"img=/image/{filename}") != "OK":
+                raise OSError(f"the device wouldn't show {filename}")
+    except OSError:
+        _theme_ready.discard(ip)  # it may have restarted: select the theme again next time
+        raise
 
 
 # --- Brightness and night mode: the device's own settings --------------------------------------------------
@@ -1318,9 +1374,13 @@ def _clamp_brightness(level: float) -> int:
     return max(BRIGHTNESS_RANGE[0], min(BRIGHTNESS_RANGE[1], int(level)))
 
 
+def _device_reply(ip: str, query: str) -> str:
+    """GET /set?<query> and return what the device answered: "OK", or "FAIL" for what it doesn't understand."""
+    return urllib.request.urlopen(f"http://{ip}/set?{query}", timeout=CONNECT_TIMEOUT).read().decode("utf-8", "replace").strip()
+
+
 def _device_set(ip: str, query: str) -> None:
-    """GET /set?<query>: the device answers "OK", or "FAIL" for what it doesn't understand."""
-    body = urllib.request.urlopen(f"http://{ip}/set?{query}", timeout=CONNECT_TIMEOUT).read().decode("utf-8", "replace").strip()
+    body = _device_reply(ip, query)
     if body != "OK":
         raise OSError(f"the device refused the setting ({body or 'no answer'})")
 
@@ -1360,8 +1420,8 @@ def push_usage(
 ) -> None:
     """Render and upload `usage` as `filename`; `show=False` uploads without switching the screen to it."""
     rotating = animation in ("auto", "random")
-    if rotating and usage.get("working"):  # its agent is busy: the mascot works too (and that isn't a rotation pick)
-        animation, rotating = WORKING_ANIMATION.get(usage.get("title", "Claude"), "idle"), False
+    if rotating and _busy_animation(usage):  # its agent is busy: the mascot shows it (and that isn't a rotation pick)
+        animation, rotating = _busy_animation(usage), False
     elif rotating:
         animation = _pick_animation(usage)
     gif_bytes = render_animation(usage, animation)
