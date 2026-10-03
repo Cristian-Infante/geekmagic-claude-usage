@@ -48,8 +48,9 @@ plain HTTP calls to the web server it already runs.
   logged in on the machine that runs this. You only need the one(s) you want to see.
 - Python 3.11+ and [Pillow](https://python-pillow.org/). For the tray app also
   `pystray` (macOS: plus `pyobjc`; Windows: plus `tzdata`).
-- The device and this machine on the same local network. Give the device a
-  fixed IP (a DHCP reservation in your router) so it keeps working after it restarts.
+- The device and this machine on the same local network. You don't need to
+  know the device's IP: leave out `--ip` and it's found automatically (see
+  [Finding the device](#finding-the-device)).
 
 ## Quick start
 
@@ -58,8 +59,8 @@ git clone https://github.com/RubenU2002/geekmagic-claude-usage.git
 cd geekmagic-claude-usage
 pip install Pillow pystray      # macOS: also pyobjc · Windows: also tzdata
 
-# find your device's IP (your router, or the device's own screen/menu)
-python tray.py --ip 192.168.1.18
+python tray.py                     # finds the screen on your network by itself
+python tray.py --ip 192.168.1.18   # ...or tell it where the screen is
 ```
 
 That starts the [tray app](#tray-app): it keeps the screen updated every 30 s
@@ -67,9 +68,10 @@ and gives you an icon to switch between Claude and Codex. No tray? Run a single
 provider from the command line instead:
 
 ```bash
-python geekmagic_claude.py --ip 192.168.1.18                       # Claude, once
-python geekmagic_claude.py --ip 192.168.1.18 --provider codex      # Codex, once
+python geekmagic_claude.py                                         # Claude, once
+python geekmagic_claude.py --provider codex                        # Codex, once
 python geekmagic_claude.py --ip 192.168.1.18 --loop 60             # repeat every 60 s
+python geekmagic_claude.py --discover                              # just list the devices found
 ```
 
 `codex` is looked up on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`,
@@ -85,20 +87,83 @@ adds an icon to switch provider.
 | | Windows / Linux | macOS |
 |---|---|---|
 | Switch provider | left-click the icon | click the menu-bar icon, choose Claude or Codex |
-| Menu | right-click: Claude, Codex, Update now, View logs, Quit | same, from the same click |
+| Menu | right-click: Claude, Codex, Split view, Update now, Notifications, View logs, Quit | same, from the same click |
+| Split view | menu item **Split view** (the click never enters it; it takes you back out) | menu item **Split view** |
+
+The menu labels in the app are in Spanish: *Vista dividida* (Split view),
+*Actualizar ahora* (Update now), *Notificaciones*, *Ver logs* and *Salir* (Quit).
 
 - **Near-instant switching.** Each provider's last image already lives on the
   device (and is remembered across restarts), so a click only changes which one
   is shown; fresh data uploads in the background, and a click cancels any
   upload in flight.
-- **Screen off or unreachable?** It retries every ~10 s and shows the image as
-  soon as the device answers.
+- **It remembers the view you left** (Claude, Codex or the split view) and comes
+  back to it after a restart, a reboot, or the screen coming back online. `--provider`
+  only picks the view of the very first run.
+- **Screen off or unreachable?** It retries every ~10 s, and the moment the
+  device answers it puts your view back on screen (and looks for it on the
+  network if it moved, see below).
+- **After an update** the images stored on the device were drawn by the old
+  code, so the app redraws them once in the background (one per cycle) instead
+  of leaving old labels or colours there until you open each view.
 - **View logs** opens `tray.log` (next to the script, rotated at 512 KB).
+  What the app remembers between runs lives in `tray_state.json`.
+
+### Split view
+
+A third screen with **both providers at once**, Claude on top and Codex below,
+each with its mascot, two bars and reset countdowns:
+
+<img src="docs/preview-split.png" width="480" alt="Split view: normal, with alert colours, and with Claude's panel dimmed because its data is stale">
+
+*Normal, with alert colours (Claude 75 % / 92 %, Codex 96 %), and with Claude's panel dimmed as stale.*
+
+It's only turned on from the menu (**Split view**, the checkbox next to Codex), so
+the left-click keeps alternating Claude and Codex. While it's on, the tray icon
+shows both mascots and both providers are read every cycle (alerts keep working).
+Click the icon, or untick the menu item, to go back to the provider you were on; picking
+Claude or Codex in the menu leaves it too. Like the other screens it's remembered
+on the device, so turning it on is instant after the first time. If one provider
+can't be read, its panel shows its last numbers dimmed ("! stale since 2:57 PM")
+while the other keeps updating.
+
+### Alerts
+
+- **Colours.** From 70 % a bar and its number turn yellow, from 90 % red, on
+  both providers' screens, so a glance tells you if you're running low.
+- **Notifications.** A desktop notification appears the first time a provider's
+  session or week reaches **80 %** and **95 %**, and again when that window
+  **resets**. It watches *both* providers even when only one is on screen
+  (the hidden one is read every 2 minutes). Each alert fires once, also across
+  restarts. Turn them off from the menu (**Notifications**); the choice is remembered.
+  Thresholds live in `alerts.py`.
+
+<img src="docs/preview-states.png" width="480" alt="Normal, yellow (75%), red (96%) and dimmed stale screens, for Claude and Codex">
+
+*Top: Claude at 45 % / 75 % / 96 %. Bottom: Codex at 45 %, 75 %, and the dimmed "no fresh data" screen.*
+
+### Stale data
+
+If the numbers can't be refreshed for 3 minutes (say Claude Code is logged out
+or you lost internet but the screen is still reachable), the screen shows the
+last reading **dimmed** with "! No fresh data since 2:57 PM" instead of passing
+it off as current. It goes back to normal on the next successful read.
+
+### Finding the device
+
+You can leave `--ip` out. The app tries the address you gave, then the last one
+it remembers, and otherwise scans your local network (about 4 s) for something
+answering like a SmallTV (`/space.json`). If the screen later stops answering,
+it scans again after a minute, so a new address after a router restart or a
+power cut is picked up by itself (it notifies you, and remembers it).
+`python geekmagic_claude.py --discover` lists what it finds. If you have several
+screens, pass `--ip` to say which one.
 
 ### Start it at login (any OS)
 
 ```bash
-python tray.py --ip 192.168.1.18 --install-startup   # creates the right thing for your OS
+python tray.py --install-startup                      # creates the right thing for your OS
+python tray.py --ip 192.168.1.18 --install-startup    # ...pinning the device address
 python tray.py --uninstall-startup
 ```
 
@@ -234,6 +299,29 @@ launchctl load   ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist   # 
 Other platforms: use `cron`, a `systemd --user` timer, or Windows Task
 Scheduler to run `python3 geekmagic_claude.py --ip ... [--provider codex]` on a
 schedule — or just use the tray app's `--install-startup`.
+
+## Tests
+
+All the tests live in [`tests/`](tests/) and need nothing but Python: no real
+device, no Claude Code or Codex login (the device, the network and the
+providers are faked).
+
+```bash
+python -m unittest                      # everything, from the repo root
+python -m unittest tests.test_alerts    # one file
+```
+
+| File | Covers |
+|---|---|
+| `test_alerts.py` | colour thresholds and when notifications fire |
+| `test_codex_usage.py` | the Codex limits query (against a fake `app-server`) |
+| `test_discover.py` | finding the device on the network |
+| `test_render_states.py` | alert colours, stale dimming, 12-hour clock, split view drawing |
+| `test_device_errors.py` | a device that cuts responses short is treated as unreachable |
+| `test_tray_logic.py` | tray behaviour: view restore, alerts, stale data, rediscovery, split view, clicks vs uploads |
+
+The tray tests need a desktop session (they build the tray icon objects) and
+skip themselves without one.
 
 ## Firmware API reference (stock SmallTV Ultra)
 

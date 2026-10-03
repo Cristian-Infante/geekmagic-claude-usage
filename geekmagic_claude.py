@@ -2,7 +2,7 @@
 """Push Claude Code's /usage limits to a GeekMagic SmallTV Ultra (stock firmware).
 
 Reads usage via Claude Code's own CLI (`claude /usage`), zero cost, and
-renders a 240x240 animated GIF — a pixel-art mascot plus Current/Weekly
+renders a 240x240 animated GIF — a pixel-art mascot plus Session/Weekly
 usage bars — uploaded straight into the device's stock Photo Album.
 See ANIMATIONS for the available mascot animations.
 
@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import http.client
 import json
 import os
@@ -35,6 +36,8 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
+import alerts
+
 WIDTH = HEIGHT = 240
 IMAGE_NAME = "claude-usage.gif"
 IMAGE_NAMES = {"claude": IMAGE_NAME, "codex": "codex-usage.gif"}  # one file per provider, so switching is just /set?img
@@ -44,6 +47,8 @@ _OLD_IMAGE_NAMES = ("claude-usage.jpg",)  # cleaned up on first run after the GI
 # like a watch face: bold numbers, pill badges, no card boxes.
 BG = "#18160F"
 PILL_BG = "#4A3F4D"
+# Past the thresholds in alerts.py the percentage and its bar swap the provider's accent for these.
+STATE_COLORS = {"warn": "#FFD23F", "crit": "#FF2D55"}
 CURRENT_ACCENT = "#FA5407"
 WEEKLY_ACCENT = "#E8B24D"
 TEXT = "#F5F4EF"
@@ -272,6 +277,11 @@ def _parse_reset(text: str, now: datetime) -> datetime | None:
         if candidate >= local_now:
             return candidate
     return candidate
+
+
+def _clock(moment: datetime) -> str:
+    """12-hour clock time, "2:57 PM". Built by hand: strftime's %p follows the system locale ("p. m." in Spanish)."""
+    return f"{moment.hour % 12 or 12}:{moment.minute:02d} {'AM' if moment.hour < 12 else 'PM'}"
 
 
 def _format_delta(reset_at: datetime | None, now: datetime) -> str:
@@ -720,7 +730,7 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
     draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=title_font, fill=TEXT)
 
     _draw_section(
-        draw, top=40, label="Current", percent=usage["current_pct"],
+        draw, top=40, label="Session", percent=usage["current_pct"],
         reset_text=_format_delta(usage["current_reset"], usage["now"]),
         accent=theme["current"],
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
@@ -732,9 +742,15 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
         pill_font=pill_font, pct_font=pct_font, reset_font=reset_font,
     )
 
-    footer_text = f"* Updated {usage['now']:%H:%M}"
+    if usage.get("stale"):
+        # Last known numbers that couldn't be refreshed: dim everything and say since when.
+        image = Image.blend(image, Image.new("RGB", image.size, BG), 0.55)
+        draw = ImageDraw.Draw(image)
+        footer_text, footer_color = f"! No fresh data since {_clock(usage['now'])}", STATE_COLORS["warn"]
+    else:
+        footer_text, footer_color = f"* Updated {_clock(usage['now'])}", theme["current"]
     bbox = draw.textbbox((0, 0), footer_text, font=footer_font)
-    draw.text((((240 - (bbox[2] - bbox[0])) // 2), 223), footer_text, font=footer_font, fill=theme["current"])
+    draw.text((((240 - (bbox[2] - bbox[0])) // 2), 223), footer_text, font=footer_font, fill=footer_color)
 
     return image
 
@@ -749,7 +765,10 @@ def render(usage: dict) -> bytes:
 def render_animation(usage: dict, animation: str = DEFAULT_ANIMATION) -> bytes:
     """Looping GIF for one of the named ANIMATIONS presets."""
     frames_spec = ANIMATIONS[animation]
-    frames = [_render_frame(usage, dx, dy, extra) for dx, dy, extra in frames_spec]
+    return _encode_gif([_render_frame(usage, dx, dy, extra) for dx, dy, extra in frames_spec])
+
+
+def _encode_gif(frames: list[Image.Image]) -> bytes:
     # One palette built from *all* frames, so colours that only appear later (a bolt, sparkles, steam) survive.
     sheet = Image.new("RGB", (WIDTH, HEIGHT * len(frames)))
     for i, frame in enumerate(frames):
@@ -764,11 +783,86 @@ def render_animation(usage: dict, animation: str = DEFAULT_ANIMATION) -> bytes:
     return buf.getvalue()
 
 
+# --- Split view: both providers on one screen ---------------------------------------------------------
+
+SPLIT_PANEL_H = 118  # two panels of this height, a 4 px divider between them
+
+
+def _draw_split_row(draw, *, top, label, percent, reset_text, accent, fonts) -> None:
+    """One compact usage row: big number + bar on the first line, label + reset countdown under it."""
+    state = alerts.bar_state(percent)
+    color = STATE_COLORS.get(state, accent)
+    pct_text = f"{percent:.0f}%" if percent is not None else "--%"
+    draw.text((10, top - 1), pct_text, font=fonts["pct"], fill=STATE_COLORS.get(state, TEXT))
+    bar_left, bar_right, bar_top, bar_h = 68, 230, top + 4, 12
+    draw.rounded_rectangle((bar_left, bar_top, bar_right, bar_top + bar_h), radius=6, fill=PILL_BG)
+    if percent:
+        fill_w = round((bar_right - bar_left) * min(percent, 100) / 100)
+        if fill_w > 0:
+            draw.rounded_rectangle(
+                (bar_left, bar_top, bar_left + fill_w, bar_top + bar_h), radius=min(6, max(2, fill_w // 2)), fill=color,
+            )
+    draw.text((10, top + 26), label, font=fonts["small"], fill=MUTED)
+    draw.text((bar_left, top + 26), reset_text, font=fonts["small"], fill=MUTED)
+
+
+def _draw_split_panel(image: Image.Image, top: int, usage: dict, bob: int, fonts: dict) -> None:
+    """One provider's panel (header + two rows) at vertical offset `top`; dimmed and dated if `usage["stale"]`."""
+    theme = _theme(usage)
+    draw = ImageDraw.Draw(image)
+    _draw_mascot(image, (10, top + 8 + bob), 2, theme)
+    draw.text((46, top + 5), usage.get("title", "Usage"), font=fonts["title"], fill=TEXT)
+    updated = _clock(usage["now"])
+    if not usage.get("stale"):
+        width = draw.textlength(updated, font=fonts["small"])
+        draw.text((230 - width, top + 10), updated, font=fonts["small"], fill=theme["current"])
+    for row_top, label, pct_key, reset_key, accent in (
+        (top + 32, "Session", "current_pct", "current_reset", theme["current"]),
+        (top + 74, "Weekly", "weekly_pct", "weekly_reset", theme["weekly"]),
+    ):
+        _draw_split_row(
+            draw, top=row_top, label=label, percent=usage[pct_key],
+            reset_text=_format_delta(usage[reset_key], usage["now"]), accent=accent, fonts=fonts,
+        )
+    if usage.get("stale"):
+        box = (0, top, WIDTH, top + SPLIT_PANEL_H)
+        image.paste(Image.blend(image.crop(box), Image.new("RGB", (WIDTH, SPLIT_PANEL_H), BG), 0.55), box)
+        text = f"! stale since {updated}"
+        width = ImageDraw.Draw(image).textlength(text, font=fonts["small"])
+        ImageDraw.Draw(image).text((230 - width, top + 10), text, font=fonts["small"], fill=STATE_COLORS["warn"])
+
+
+def _render_split_frame(panels: list[dict], bob: int = 0) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    fonts = {
+        "title": ImageFont.load_default(size=17), "pct": ImageFont.load_default(size=22),
+        "small": ImageFont.load_default(size=11),
+    }
+    for i, usage in enumerate(panels[:2]):
+        _draw_split_panel(image, i * (SPLIT_PANEL_H + 4), usage, bob, fonts)
+    ImageDraw.Draw(image).line((10, SPLIT_PANEL_H + 1, 230, SPLIT_PANEL_H + 1), fill=PILL_BG, width=2)  # divider
+    return image
+
+
+def render_split(panels: list[dict]) -> bytes:
+    """Looping GIF with two providers' usage stacked on one screen (their mascots bob gently)."""
+    return _encode_gif([_render_split_frame(panels, bob) for bob in _IDLE_BOB])
+
+
+def push_split(
+    ip: str, panels: list[dict], filename: str, show: bool = True, cancel: threading.Event | None = None,
+) -> None:
+    """Render and upload the split view as `filename`."""
+    upload(ip, render_split(panels), filename, "image/gif", show, cancel)
+
+
 def _draw_section(draw, *, top, label, percent, reset_text, accent, pill_font, pct_font, reset_font) -> None:
     panel_left, panel_right = 10, 230
     pad = 4
     pct_text = f"{percent:.0f}%" if percent is not None else "--%"
-    draw.text((panel_left + pad, top + 6), pct_text, font=pct_font, fill=TEXT)
+    state = alerts.bar_state(percent)  # past the warn/crit thresholds the number and bar change colour
+    accent = STATE_COLORS.get(state, accent)
+    draw.text((panel_left + pad, top + 6), pct_text, font=pct_font, fill=STATE_COLORS.get(state, TEXT))
 
     pill_bbox = draw.textbbox((0, 0), label, font=pill_font)
     pill_text_w = pill_bbox[2] - pill_bbox[0]
@@ -800,6 +894,18 @@ class UploadCancelled(Exception):
     pass
 
 
+def _device_errors(func):
+    """The device sometimes cuts a response short or answers garbage (http.client raises HTTPException,
+    which isn't an OSError). Report those like any other "device didn't answer properly" failure."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except http.client.HTTPException as e:
+            raise OSError(f"incomplete or invalid response from the device ({type(e).__name__})") from e
+    return wrapper
+
+
 def _abort_on_cancel(cancel: threading.Event, done: threading.Event, sock) -> None:
     """Watcher: when `cancel` fires mid-upload, reset the connection so the device stops receiving at once."""
     while not done.is_set():
@@ -813,6 +919,7 @@ def _abort_on_cancel(cancel: threading.Event, done: threading.Event, sock) -> No
             return
 
 
+@_device_errors
 def upload(
     ip: str, image_bytes: bytes, filename: str = IMAGE_NAME, content_type: str = "image/gif", show: bool = True,
     cancel: threading.Event | None = None,
@@ -861,16 +968,19 @@ def upload(
         show_image(ip, filename)
 
 
+@_device_errors
 def list_images(ip: str) -> set[str]:
     """Names of the image files stored on the device (parsed from its file-list page)."""
     html = urllib.request.urlopen(f"http://{ip}/filelist?dir=/image/", timeout=CONNECT_TIMEOUT).read().decode("utf-8", "replace")
     return set(re.findall(r"[\w.\-]+\.(?:gif|jpe?g|png)", html, re.IGNORECASE))
 
 
+@_device_errors
 def delete_image(ip: str, filename: str) -> None:
     urllib.request.urlopen(f"http://{ip}/delete?file=/image/{filename}", timeout=CONNECT_TIMEOUT).read()
 
 
+@_device_errors
 def show_image(ip: str, filename: str) -> None:
     """Pin an already-uploaded image on screen (fast: no file transfer)."""
     urllib.request.urlopen(f"http://{ip}/set?theme=3", timeout=CONNECT_TIMEOUT).read()
@@ -918,7 +1028,8 @@ def push_usage(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ip", required=True, help="GeekMagic device IP, e.g. 192.168.1.18")
+    parser.add_argument("--ip", help="GeekMagic device IP, e.g. 192.168.1.18 (omit it to find the device on your network)")
+    parser.add_argument("--discover", action="store_true", help="list the GeekMagic devices found on your network, then exit")
     parser.add_argument("--loop", type=int, metavar="SECONDS", help="repeat forever every N seconds")
     parser.add_argument(
         "--animation", default="auto", choices=[*ANIMATIONS, "auto", "random"],
@@ -926,6 +1037,19 @@ def main() -> int:
     )
     parser.add_argument("--provider", default="claude", choices=list(PROVIDERS), help="which usage to show")
     args = parser.parse_args()
+
+    if args.discover or not args.ip:
+        import discover
+        found = discover.scan()
+        if args.discover:
+            print("\n".join(found) if found else "No GeekMagic device found on this network.")
+            return 0 if found else 1
+        if len(found) != 1:
+            print("error: " + (f"several devices found ({', '.join(found)}); pick one with --ip"
+                               if found else "no GeekMagic device found; pass --ip"), file=sys.stderr)
+            return 1
+        args.ip = found[0]
+        print(f"found the device at {args.ip}")
 
     try:
         if args.loop:
