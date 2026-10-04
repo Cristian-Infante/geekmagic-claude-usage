@@ -11,31 +11,34 @@ import argparse
 import sys
 import time
 
-from geekmagic.device import files
-from geekmagic.device.client import GeekMagicDevice
-from geekmagic.errors import UsageError
-from geekmagic.providers import PROVIDERS
-from geekmagic.render import views
-from geekmagic.render.animations import ANIMATIONS, Rotation
+from geekmagic.adapters.device.client import GeekMagicDevice
+from geekmagic.adapters.render.animations import ANIMATIONS
+from geekmagic.adapters.render.renderer import PillowRenderer
+from geekmagic.application import image_files
+from geekmagic.bootstrap import build_registry
+from geekmagic.core.errors import UsageError
+from geekmagic.core.model import Usage
+from geekmagic.core.ports import Renderer
 
-_rotation = Rotation()
+PROVIDERS = build_registry()
+_renderer = PillowRenderer()
 _cleaned_up: set[str] = set()
 
 
 def _cleanup_old_images(device: GeekMagicDevice) -> None:
-    for name in files.LEGACY_NAMES:
+    for name in image_files.LEGACY_NAMES:
         try:
             device.delete_image(name)
         except OSError:
             pass
 
 
-def push_usage(device: GeekMagicDevice, usage: dict, animation: str, filename: str, rotation: Rotation = _rotation) -> None:
+def push_usage(device: GeekMagicDevice, provider: str, usage: Usage, animation: str, filename: str,
+               renderer: Renderer = _renderer) -> None:
     """Render and upload `usage` as `filename`, and show it."""
-    rendered = views.SINGLE.render(usage, animation, rotation)
+    rendered = renderer.render(provider, usage, animation)
     device.upload(rendered.gif, filename)
-    for title, name in rendered.picks:
-        rotation.record(title, name)  # now it really is on the device
+    renderer.confirm(rendered)  # now it really is on the device
     device.show_image(filename)
     if device.ip not in _cleaned_up:  # one-time migration cleanup, not worth an extra request every push
         _cleanup_old_images(device)
@@ -47,7 +50,7 @@ def push_usage(device: GeekMagicDevice, usage: dict, animation: str, filename: s
 
 
 def run_once(ip: str, animation: str, provider: str = "claude") -> None:
-    push_usage(GeekMagicDevice(ip), PROVIDERS[provider].fetch(), animation, files.image_name(provider))
+    push_usage(GeekMagicDevice(ip), provider, PROVIDERS[provider].fetch(), animation, image_files.image_name(provider))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.discover or not args.ip:
-        from geekmagic.device import discovery
+        from geekmagic.adapters.device import discovery
         found = discovery.scan()
         if args.discover:
             print("\n".join(found) if found else "No GeekMagic device found on this network.")

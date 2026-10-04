@@ -8,7 +8,7 @@
 The code lives in the `geekmagic` package (see geekmagic/app/); this is just the launcher the start-at-login entry runs.
 """
 
-from geekmagic.app.main import main
+from geekmagic.tray_main import main
 
 if __name__ == "__main__":
     main()
