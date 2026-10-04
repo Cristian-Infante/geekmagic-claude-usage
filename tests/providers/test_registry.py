@@ -17,8 +17,8 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(KEY_OF, {"Claude": "claude", "Codex": "codex"}, "a reading says who it is by title")
 
     def test_each_one_says_how_to_sign_in_and_where_to_get_its_cli(self):
+        self.assertEqual({p.key: p.login_args for p in ALL}, {"claude": ("auth", "login"), "codex": ("login",)})
         for provider in ALL:
-            self.assertTrue(provider.login_args, provider.key)
             self.assertTrue(provider.install_hint, provider.key)
 
     def test_each_one_has_a_look_and_animations_on_the_screen(self):

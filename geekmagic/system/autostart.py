@@ -16,9 +16,13 @@ from pathlib import Path
 
 from geekmagic.paths import TRAY_SCRIPT
 
-TASK_NAME = "GeekMagicClaude"  # Windows scheduled task
-LABEL = "com.geekmagic.claude-usage"  # macOS LaunchAgent label
-DESKTOP_FILE = "geekmagic-claude-usage.desktop"  # Linux autostart entry
+TASK_NAME = "GeekMagicUsage"  # Windows scheduled task
+LABEL = "com.geekmagic.usage"  # macOS LaunchAgent label
+DESKTOP_FILE = "geekmagic-usage.desktop"  # Linux autostart entry
+# What they were called when the app only showed Claude: installing replaces them, uninstalling removes them too.
+LEGACY_TASK_NAME = "GeekMagicClaude"
+LEGACY_LABEL = "com.geekmagic.claude-usage"
+LEGACY_DESKTOP_FILE = "geekmagic-claude-usage.desktop"
 
 # launchd doesn't load your shell's PATH, so `claude` / `codex` in these folders would otherwise be missed.
 MAC_PATH = ":".join(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", str(Path.home() / ".local" / "bin")])
@@ -40,7 +44,15 @@ def _powershell(script: str) -> None:
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], check=True)
 
 
+def _remove_task(name: str) -> None:
+    _powershell(f"""
+Stop-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName {name} -Confirm:$false -ErrorAction SilentlyContinue
+""")
+
+
 def _install_windows(command: list[str], workdir: Path) -> str:
+    _remove_task(LEGACY_TASK_NAME)  # an old install under the old name would run a second copy
     _powershell(f"""
 $act = New-ScheduledTaskAction -Execute {_ps_quote(command[0])} -Argument {_ps_quote(subprocess.list2cmdline(command[1:]))} -WorkingDirectory {_ps_quote(str(workdir))}
 $trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
@@ -52,15 +64,13 @@ Start-ScheduledTask -TaskName {TASK_NAME}
 
 
 def _uninstall_windows() -> str:
-    _powershell(f"""
-Stop-ScheduledTask -TaskName {TASK_NAME} -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName {TASK_NAME} -Confirm:$false -ErrorAction SilentlyContinue
-""")
+    _remove_task(TASK_NAME)
+    _remove_task(LEGACY_TASK_NAME)
     return f"Scheduled task '{TASK_NAME}' removed."
 
 
-def mac_plist_path() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+def mac_plist_path(label: str = LABEL) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
 def build_mac_plist(command: list[str], workdir: Path) -> bytes:
@@ -74,7 +84,15 @@ def build_mac_plist(command: list[str], workdir: Path) -> bytes:
     })
 
 
+def _remove_mac(label: str) -> Path:
+    path = mac_plist_path(label)
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], capture_output=True)
+    path.unlink(missing_ok=True)
+    return path
+
+
 def _install_mac(command: list[str], workdir: Path) -> str:
+    _remove_mac(LEGACY_LABEL)  # an old install under the old name would run a second copy
     path = mac_plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(build_mac_plist(command, workdir))
@@ -85,25 +103,24 @@ def _install_mac(command: list[str], workdir: Path) -> str:
 
 
 def _uninstall_mac() -> str:
-    path = mac_plist_path()
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], capture_output=True)
-    path.unlink(missing_ok=True)
-    return f"LaunchAgent {path} removed."
+    _remove_mac(LEGACY_LABEL)
+    return f"LaunchAgent {_remove_mac(LABEL)} removed."
 
 
-def linux_desktop_path() -> Path:
+def linux_desktop_path(name: str = DESKTOP_FILE) -> Path:
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return config / "autostart" / DESKTOP_FILE
+    return config / "autostart" / name
 
 
 def build_desktop_entry(command: list[str], workdir: Path) -> str:
     return (
-        "[Desktop Entry]\nType=Application\nName=GeekMagic Claude/Codex usage\n"
+        "[Desktop Entry]\nType=Application\nName=GeekMagic usage\n"
         f"Exec={shlex.join(command)}\nPath={workdir}\nX-GNOME-Autostart-enabled=true\n"
     )
 
 
 def _install_linux(command: list[str], workdir: Path) -> str:
+    linux_desktop_path(LEGACY_DESKTOP_FILE).unlink(missing_ok=True)  # an old install under the old name would run twice
     path = linux_desktop_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_desktop_entry(command, workdir), encoding="utf-8")
@@ -112,6 +129,7 @@ def _install_linux(command: list[str], workdir: Path) -> str:
 
 def _uninstall_linux() -> str:
     linux_desktop_path().unlink(missing_ok=True)
+    linux_desktop_path(LEGACY_DESKTOP_FILE).unlink(missing_ok=True)
     return "Autostart entry removed."
 
 

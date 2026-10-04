@@ -1,8 +1,8 @@
 """Push one provider's usage to the screen from the command line, once or on a loop (the tray app does much more).
 
-    python geekmagic_claude.py --ip 192.168.1.18
-    python geekmagic_claude.py --ip 192.168.1.18 --loop 60
-    python geekmagic_claude.py --ip 192.168.1.18 --provider codex --animation bolt
+    python geekmagic_usage.py --ip 192.168.1.18
+    python geekmagic_usage.py --ip 192.168.1.18 --loop 60
+    python geekmagic_usage.py --ip 192.168.1.18 --provider codex --animation bolt
 """
 
 from __future__ import annotations

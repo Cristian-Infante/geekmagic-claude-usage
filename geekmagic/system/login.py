@@ -1,9 +1,7 @@
-"""Open a provider's sign-in in a terminal window, for when its usage can't be read because you're signed out.
+"""Open a terminal window that runs a command and stays open: how a provider's sign-in is started.
 
 Each provider's own CLI does the sign-in (a browser opens and you approve it there); this only starts it, in a visible
-terminal, since the CLIs ask questions. Once it's done the next read works and the screen fills in by itself.
-
-    Claude  `claude auth login`        Codex  `codex login`
+terminal, since the CLIs ask questions. What to run is up to the caller (see geekmagic.app.signin).
 """
 
 from __future__ import annotations
@@ -14,17 +12,11 @@ import shutil
 import subprocess
 import sys
 
-from geekmagic.providers import PROVIDERS
 
 LINUX_TERMINALS = (
     ("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]), ("konsole", ["-e"]),
     ("xfce4-terminal", ["-x"]), ("kitty", []), ("alacritty", ["-e"]), ("xterm", ["-e"]),
 )
-
-
-def executable(provider: str) -> str | None:
-    """Where the provider's CLI is (the usual install folders are searched too, as a login task's PATH is short)."""
-    return PROVIDERS[provider].find_cli()
 
 
 def terminal_command(argv: list[str], title: str, platform: str | None = None) -> list[str] | str | None:
@@ -44,16 +36,12 @@ def terminal_command(argv: list[str], title: str, platform: str | None = None) -
     return None
 
 
-def launch(provider: str) -> str:
-    """Start `provider`'s sign-in in a new terminal window: "started", "missing" (its CLI isn't installed) or
-    "failed" (no terminal to open it in). `GEEKMAGIC_NO_LOGIN=1` turns it off (the tests use it: no test may open a
-    window)."""
+def launch(argv: list[str], title: str) -> str:
+    """Run `argv` in a new terminal window that stays open (a provider's sign-in): "started", or "failed" (no terminal
+    to open it in). `GEEKMAGIC_NO_LOGIN=1` turns it off (the tests use it: no test may open a window)."""
     if os.environ.get("GEEKMAGIC_NO_LOGIN"):
         return "failed"
-    path = executable(provider)
-    if not path:
-        return "missing"
-    command = terminal_command([path, *PROVIDERS[provider].login_args], f"{PROVIDERS[provider].title} sign-in")
+    command = terminal_command(argv, title)
     if not command:
         return "failed"
     try:

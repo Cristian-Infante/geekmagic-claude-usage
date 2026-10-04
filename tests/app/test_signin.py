@@ -1,4 +1,5 @@
 """A provider that is signed out gets its sign-in opened when you pick it, and its screen says what to do."""
+import os
 import time
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ from geekmagic.app import config
 from geekmagic.app import tray_app
 from geekmagic.app.viewstate import SPLIT
 from geekmagic.errors import SignInNeeded, UsageError
+from geekmagic.providers import PROVIDERS
 from geekmagic.system import login
 from tests.support import AppTestCase, capture_screen, fake_fetchers, failing, usage
 
@@ -17,9 +19,15 @@ class SignInTests(AppTestCase):
         super().setUp()
         self.opened, self.outcome = [], "started"
         # no test may open a real window: the launcher only records what it was asked to open
-        patcher = patch.object(login, "launch", side_effect=lambda p: self.opened.append(p) or self.outcome)
+        # (it is handed the CLI's path: record whose it is) ...
+        patcher = patch.object(login, "launch", side_effect=lambda argv, title: self.opened.append(os.path.basename(argv[0])) or self.outcome)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # ...and every provider's CLI is "installed" unless a test says otherwise
+        for key, provider in PROVIDERS.items():
+            patcher = patch.object(provider, "find_cli", return_value=f"/bin/{key}")
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # picking a provider starts its sign-in in a thread: run it right here, so what happens is what's asserted
         patcher = patch.object(tray_app, "in_background", side_effect=lambda func, *args: func(*args))
         patcher.start()
@@ -63,13 +71,14 @@ class SignInTests(AppTestCase):
         self.assertEqual(self.opened, ["claude"])
 
     def test_a_missing_cli_says_how_to_install_it_instead(self):
-        self.outcome = "missing"
         app = self.make()
+        PROVIDERS["codex"].find_cli.return_value = None  # (not installed: nothing to open)
         self.sign_out(app)
         with capture_screen():
             app.select("codex")
         self.assertIn("Install the Codex CLI", app.usage.errors["codex"])
         self.assertFalse(app.signin.error_usage("codex").signin, "there is nothing to sign in to yet")
+        self.assertEqual(self.opened, [], "no window is opened for a CLI that isn't there")
 
     def test_no_terminal_still_leaves_a_message(self):
         self.outcome = "failed"

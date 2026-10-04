@@ -53,8 +53,9 @@ class SignInCoordinator:
         windows. The provider's screen says what to do, and fills in by itself once you've signed in."""
         if not force and (not self.usage.signed_out(provider) or self.pending(provider)):
             return
-        outcome = login.launch(provider)
         title = TITLES[provider]
+        cli = PROVIDERS[provider].find_cli()
+        outcome = login.launch([cli, *PROVIDERS[provider].login_args], f"{title} sign-in") if cli else "missing"
         self.login_at[provider] = time.monotonic()
         if outcome == "started":
             self.missing.discard(provider)

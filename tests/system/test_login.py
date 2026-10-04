@@ -6,7 +6,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from geekmagic.providers import PROVIDERS, claude, codex
+from geekmagic.providers import claude
 from geekmagic.render.views import error as error_view
 from geekmagic.errors import SignInNeeded, UsageError
 from geekmagic.model import ErrorScreen
@@ -48,43 +48,22 @@ class LaunchTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_each_provider_signs_in_with_its_own_command(self):
-        self.assertEqual({key: provider.login_args for key, provider in PROVIDERS.items()},
-                         {"claude": ("auth", "login"), "codex": ("login",)})
-        for provider in PROVIDERS.values():
-            self.assertTrue(provider.install_hint, f"{provider.key} says how to install its CLI")
-
     def test_the_kill_switch_opens_nothing(self):
         with patch.dict(os.environ, {"GEEKMAGIC_NO_LOGIN": "1"}), patch.object(login.subprocess, "Popen") as popen:
-            self.assertEqual(login.launch("claude"), "failed")
+            self.assertEqual(login.launch(["claude", "auth", "login"], "Claude sign-in"), "failed")
         popen.assert_not_called()
 
-    def test_a_missing_cli_is_reported_not_attempted(self):
-        with patch.object(login, "executable", return_value=None), patch.object(login.subprocess, "Popen") as popen:
-            self.assertEqual(login.launch("codex"), "missing")
-        popen.assert_not_called()
-
-    def test_it_opens_the_terminal_with_the_providers_command(self):
-        with patch.object(login, "executable", return_value="/bin/codex"), \
-                patch.object(login, "terminal_command", return_value=["term", "codex", "login"]) as build, \
-                patch.object(login.subprocess, "Popen") as popen:
-            self.assertEqual(login.launch("codex"), "started")
+    def test_it_opens_the_terminal_with_the_command_it_is_given(self):
+        with patch.object(login, "terminal_command", return_value=["term", "codex", "login"]) as build,                 patch.object(login.subprocess, "Popen") as popen:
+            self.assertEqual(login.launch(["/bin/codex", "login"], "Codex sign-in"), "started")
         build.assert_called_once_with(["/bin/codex", "login"], "Codex sign-in")
         self.assertEqual(popen.call_args.args[0], ["term", "codex", "login"])
 
     def test_no_terminal_or_a_failing_start_is_reported(self):
-        with patch.object(login, "executable", return_value="/bin/claude"), patch.object(login, "terminal_command", return_value=None):
-            self.assertEqual(login.launch("claude"), "failed")
-        with patch.object(login, "executable", return_value="/bin/claude"), \
-                patch.object(login, "terminal_command", return_value=["term"]), \
-                patch.object(login.subprocess, "Popen", side_effect=OSError("no")):
-            self.assertEqual(login.launch("claude"), "failed")
-
-    def test_codex_is_looked_for_where_the_usage_query_looks(self):
-        with patch.object(codex, "find_codex", return_value="/ext/codex"):
-            self.assertEqual(login.executable("codex"), "/ext/codex")
-        with patch.object(claude, "which", side_effect=lambda name: f"/bin/{name}"):
-            self.assertEqual(login.executable("claude"), "/bin/claude")
+        with patch.object(login, "terminal_command", return_value=None):
+            self.assertEqual(login.launch(["claude"], "t"), "failed")
+        with patch.object(login, "terminal_command", return_value=["term"]),                 patch.object(login.subprocess, "Popen", side_effect=OSError("no")):
+            self.assertEqual(login.launch(["claude"], "t"), "failed")
 
 
 class SignedOutDetectionTests(unittest.TestCase):

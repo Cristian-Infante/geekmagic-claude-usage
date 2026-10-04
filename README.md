@@ -68,10 +68,10 @@ and gives you an icon to switch between Claude and Codex. No tray? Run a single
 provider from the command line instead:
 
 ```bash
-python geekmagic_claude.py                                         # Claude, once
-python geekmagic_claude.py --provider codex                        # Codex, once
-python geekmagic_claude.py --ip 192.168.1.18 --loop 60             # repeat every 60 s
-python geekmagic_claude.py --discover                              # just list the devices found
+python geekmagic_usage.py                                         # Claude, once
+python geekmagic_usage.py --provider codex                        # Codex, once
+python geekmagic_usage.py --ip 192.168.1.18 --loop 60             # repeat every 60 s
+python geekmagic_usage.py --discover                              # just list the devices found
 ```
 
 `codex` is looked up on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin`,
@@ -331,7 +331,7 @@ it remembers, and otherwise scans your local network (about 4 s) for something
 answering like a SmallTV (`/space.json`). If the screen later stops answering,
 it scans again after a minute, so a new address after a router restart or a
 power cut is picked up by itself (it notifies you, and remembers it).
-`python geekmagic_claude.py --discover` lists what it finds. If you have several
+`python geekmagic_usage.py --discover` lists what it finds. If you have several
 screens, pass `--ip` to say which one.
 
 ### Start it at login (any OS)
@@ -342,11 +342,13 @@ python tray.py --ip 192.168.1.18 --install-startup    # ...pinning the device ad
 python tray.py --uninstall-startup
 ```
 
-- **Windows:** a Task Scheduler task (`GeekMagicClaude`) that runs at logon, windowless.
-- **macOS:** a LaunchAgent `~/Library/LaunchAgents/com.geekmagic.claude-usage.plist`
+- **Windows:** a Task Scheduler task (`GeekMagicUsage`) that runs at logon, windowless. (Installs made when the app only showed Claude
+  used other names — `GeekMagicClaude`, `com.geekmagic.claude-usage`, `geekmagic-claude-usage.desktop` —
+  and are replaced when you install again, and removed when you uninstall.)
+- **macOS:** a LaunchAgent `~/Library/LaunchAgents/com.geekmagic.usage.plist`
   (restarts after a crash, not after you choose Quit; sets a `PATH` that
   includes Homebrew and `~/.local/bin` so `claude`/`codex` are found).
-- **Linux:** an autostart entry `~/.config/autostart/geekmagic-claude-usage.desktop`
+- **Linux:** an autostart entry `~/.config/autostart/geekmagic-usage.desktop`
   (needs a desktop with a system tray / AppIndicator).
 
 ## Animations
@@ -358,8 +360,8 @@ them live side by side in the `ANIMATIONS` dict in `geekmagic/render/animations.
 picking one never deletes another, and adding a new one is just a new entry.
 
 ```bash
-python geekmagic_claude.py --ip 192.168.1.18 --animation coffee
-python geekmagic_claude.py --ip 192.168.1.18 --provider codex --animation bolt
+python geekmagic_usage.py --ip 192.168.1.18 --animation coffee
+python geekmagic_usage.py --ip 192.168.1.18 --provider codex --animation bolt
 ```
 
 ### Claude
@@ -426,25 +428,25 @@ usage) and `THEMES` (its mascot and colours).
 
 ## Running it without the tray (macOS launchd loop)
 
-The included `com.example.geekmagic-claude.plist` is a
+The included `com.example.geekmagic-usage.plist` is a
 [launchd](https://www.launchd.info/) LaunchAgent that runs the plain command
 line script in the background, at login and on a timer. (The tray app's
 `--install-startup` is simpler if you want the tray.)
 
 1. Copy it and fill in the placeholders:
    ```bash
-   cp com.example.geekmagic-claude.plist ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist
+   cp com.example.geekmagic-usage.plist ~/Library/LaunchAgents/com.yourname.geekmagic-usage.plist
    ```
    Edit that copy:
-   - `Label` — make it match the filename (e.g. `com.yourname.geekmagic-claude`)
+   - `Label` — make it match the filename (e.g. `com.yourname.geekmagic-usage`)
    - The `python3` path — run `which python3` and use that exact path
-   - The path to `geekmagic_claude.py` — wherever you cloned this repo
+   - The path to `geekmagic_usage.py` — wherever you cloned this repo
    - `--ip` — your device's IP (and `--provider codex` for Codex)
    - Both `StandardOutPath`/`StandardErrorPath` — anywhere you want the log written
 
 2. Load it:
    ```bash
-   launchctl load ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist
+   launchctl load ~/Library/LaunchAgents/com.yourname.geekmagic-usage.plist
    ```
 
 It runs once immediately (`RunAtLoad`) and every 60 seconds (`StartInterval`)
@@ -452,8 +454,8 @@ while you're logged in, and restarts after a reboot or logout/login.
 
 ```bash
 tail -f /path/to/your/log.txt                                            # watch it work
-launchctl unload ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist   # pause
-launchctl load   ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist   # resume
+launchctl unload ~/Library/LaunchAgents/com.yourname.geekmagic-usage.plist   # pause
+launchctl load   ~/Library/LaunchAgents/com.yourname.geekmagic-usage.plist   # resume
 ```
 
 **Gotchas**
@@ -472,7 +474,7 @@ launchctl load   ~/Library/LaunchAgents/com.yourname.geekmagic-claude.plist   # 
   stops it.
 
 Other platforms: use `cron`, a `systemd --user` timer, or Windows Task
-Scheduler to run `python3 geekmagic_claude.py --ip ... [--provider codex]` on a
+Scheduler to run `python3 geekmagic_usage.py --ip ... [--provider codex]` on a
 schedule — or just use the tray app's `--install-startup`.
 
 ## Code layout
@@ -490,7 +492,7 @@ patterns used and how to add a provider or a view):
 | `system/` | What depends on the OS: notifications, sign-in windows, lock detection, start at login. |
 | `app/` | The tray app: a small set of services (usage, screen, agents, backlight...) wired together in `tray_app.py`. |
 
-`tray.py` and `geekmagic_claude.py` at the top are launchers for `geekmagic.app` and `geekmagic.cli`.
+`tray.py` and `geekmagic_usage.py` at the top are launchers for `geekmagic.app` and `geekmagic.cli`.
 
 ## Tests
 
@@ -511,6 +513,9 @@ python -m unittest discover -s tests/app -t .   # one folder
 | `tests/device/` | the device client against a fake device (one request to show an image, brightness, night mode, truncated replies), and finding it on the network |
 | `tests/system/` | notifications per OS, screen-lock detection, one copy at a time, opening a provider's sign-in |
 | `tests/app/` | the tray app, one file per service: usage and alerts, the screen and its stored images, view restore, clicks vs uploads, pause and lock, backlight, agents (per session), local activity counts, sign-in, the menu, timing |
+
+`tests/test_architecture.py` keeps the layers honest: a lower layer may not import from one above it (the diagrams in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) are that table).
 
 `tests/support.py` has the shared harness: a tray app with the device, the network, the providers and the notifications
 faked out, and a recorder of what it renders and sends.

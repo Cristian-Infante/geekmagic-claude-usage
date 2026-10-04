@@ -1,52 +1,109 @@
 # Architecture
 
-The code lives in the `geekmagic` package. `tray.py` and `geekmagic_claude.py` at the top are one-line launchers (the
+The code lives in the `geekmagic` package. `tray.py` and `geekmagic_usage.py` at the top are one-line launchers (the
 start-at-login entry runs `tray.py`).
 
-```
-geekmagic/
-  model.py             Usage, Window, Projection, CodexExtra, ErrorScreen: what the app passes around, typed
-  errors.py            UsageError, SignInNeeded
-  paths.py             where the app keeps its own files
-  providers/           WHAT is read: one module per AI tool, behind one interface
-    base.py              Provider (abstract): fetch(), find_cli(), local_stats(), agent_state(), login_args
-    claude.py codex.py   ClaudeProvider / CodexProvider (+ the code that reads each one's usage)
-    __init__.py          the registry: ALL, PROVIDERS, TITLES
-  insights/            what the numbers MEAN (pure logic, no screen, no device)
-    pace.py alerts.py    projection of a usage window; alert thresholds
-    usage_stats.py       activity counted from the providers' local logs
-    agent_activity.py    is an agent working / waiting for you, from its log
-  render/              how it LOOKS (no network, no state): readings in, pictures out
-    palette.py mascots.py props.py animations.py   colours, pixel-art mascots and what they hold, their animations
-    components.py        the pieces screens are drawn from (bars, pills, the pace line, tags)
-    gif.py               frames -> the small GIF the device stores
-    views/               one class per screen: SingleView, SplitView, StatsView, BreakdownView, HoursView, ErrorView
-  device/              the SCREEN on the network
-    client.py            GeekMagicDevice: upload, show an image, list/delete, brightness, night mode
-    discovery.py         finding it; files.py: the names of the images kept on it
-  system/              what depends on the operating system
-    notifier.py session_lock.py autostart.py single_instance.py login.py executables.py
-  app/                 the tray app: keeps the screen up to date
-    tray_app.py          the composition root: builds the parts below, wires them, handles clicks
-    scheduler.py         the worker loop
-    usage.py             UsageService (read providers), UsageHistory, AlertTracker
-    screen.py            Screen: the device's address and state, what's stored on it, uploads
-    agents.py            AgentMonitor: per-session tracking of working / waiting / finished
-    activity.py          ActivityCounter: stats from the local logs, in the background
-    backlight.py power.py signin.py notifications.py
-    viewstate.py icons.py menu.py persistence.py state_store.py config.py render_id.py main.py
+```mermaid
+flowchart LR
+    subgraph top["entry points"]
+        tray["tray.py"]
+        cli["geekmagic_usage.py"]
+    end
+    subgraph base["shared"]
+        model["model.py<br/>Usage, Window, Projection,<br/>CodexExtra, ErrorScreen"]
+        errors["errors.py<br/>UsageError, SignInNeeded"]
+        paths["paths.py"]
+    end
+    subgraph providers["providers/ : WHAT is read"]
+        pbase["Provider (interface)"]
+        pclaude["ClaudeProvider"]
+        pcodex["CodexProvider"]
+        pbase --> pclaude
+        pbase --> pcodex
+    end
+    subgraph insights["insights/ : what the numbers MEAN"]
+        pace["pace.py"]
+        alerts["alerts.py"]
+        stats["usage_stats.py"]
+        activity["agent_activity.py"]
+    end
+    subgraph render["render/ : how it LOOKS"]
+        views["views/<br/>Single, Split, Stats,<br/>Breakdown, Hours, Error"]
+        look["palette, mascots,<br/>animations, components, gif"]
+        views --> look
+    end
+    subgraph device["device/ : the SCREEN"]
+        client["GeekMagicDevice"]
+        discovery["discovery.py, files.py"]
+    end
+    subgraph system["system/ : the OS"]
+        sysmods["notifier, session_lock,<br/>autostart, single_instance,<br/>login, executables"]
+    end
+    subgraph app["app/ : the tray app"]
+        tray_app["TrayApp<br/>(composition root)"]
+        services["Scheduler, UsageService, Screen,<br/>AgentMonitor, ActivityCounter,<br/>Backlight, Power, SignInCoordinator,<br/>Notifications, Persistence"]
+        tray_app --> services
+    end
+    tray --> tray_app
+    cli --> client
+    cli --> views
+    services --> pbase
+    services --> views
+    services --> client
+    services --> sysmods
+    services --> insights
 ```
 
 ## Layers
 
-Dependencies point downwards only: `app` uses everything; `render`, `device`, `insights` and `providers` don't know about
-`app`; `render` doesn't know about the network or the providers; `providers` don't know about screens.
+Dependencies point downwards only: `app` uses everything; `providers`, `render` and `device` don't know about
+`app`; `render` knows nothing of providers or the network; `system` and `device` know nothing of the rest. A test
+(`tests/test_architecture.py`) keeps it that way.
 
+```mermaid
+flowchart TD
+    app["app"] --> providers
+    app --> render
+    app --> device
+    app --> insights
+    app --> system
+    cli["cli"] --> providers
+    cli --> render
+    cli --> device
+    providers --> insights
+    providers --> system
+    render --> insights
+    providers --> model["model, errors"]
+    render --> model
+    insights --> model
+    device --> model
+    system --> paths["paths"]
 ```
-        app  ────────────────┐
-         │                   │
-   ┌─────┼───────┬─────────┐ │
-render  device  providers  insights   system
+
+## One update cycle
+
+What the worker does each time (30 s by default, or when a click or an agent change wakes it):
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant U as UsageService
+    participant P as Provider
+    participant C as Screen
+    participant V as View
+    participant D as GeekMagicDevice
+    S->>U: fetch(provider)
+    U->>P: fetch()
+    P-->>U: Usage
+    U->>U: history, pace, alerts
+    U-->>S: Usage
+    S->>C: deliver(view, data)
+    C->>V: render(data, animation, rotation)
+    V-->>C: Rendered (GIF + picks)
+    C->>D: upload(GIF, spare slot)
+    D-->>C: stored
+    C->>C: remember picks, swap slot
+    C->>D: show_image(file) if still the active view
 ```
 
 ## Patterns, and where to look
