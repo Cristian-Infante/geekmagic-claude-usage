@@ -3,86 +3,110 @@
 The code lives in the `geekmagic` package. `tray.py` and `geekmagic_usage.py` at the top are one-line launchers (the
 start-at-login entry runs `tray.py`).
 
-```mermaid
-flowchart LR
-    subgraph top["entry points"]
-        tray["tray.py"]
-        cli["geekmagic_usage.py"]
-    end
-    subgraph base["shared"]
-        model["model.py<br/>Usage, Window, Projection,<br/>CodexExtra, ErrorScreen"]
-        errors["errors.py<br/>UsageError, SignInNeeded"]
-        paths["paths.py"]
-    end
-    subgraph providers["providers/ : WHAT is read"]
-        pbase["Provider (interface)"]
-        pclaude["ClaudeProvider"]
-        pcodex["CodexProvider"]
-        pbase --> pclaude
-        pbase --> pcodex
-    end
-    subgraph insights["insights/ : what the numbers MEAN"]
-        pace["pace.py"]
-        alerts["alerts.py"]
-        stats["usage_stats.py"]
-        activity["agent_activity.py"]
-    end
-    subgraph render["render/ : how it LOOKS"]
-        views["views/<br/>Single, Split, Stats,<br/>Breakdown, Hours, Error"]
-        look["palette, mascots,<br/>animations, components, gif"]
-        views --> look
-    end
-    subgraph device["device/ : the SCREEN"]
-        client["GeekMagicDevice"]
-        discovery["discovery.py, files.py"]
-    end
-    subgraph system["system/ : the OS"]
-        sysmods["notifier, session_lock,<br/>autostart, single_instance,<br/>login, executables"]
-    end
-    subgraph app["app/ : the tray app"]
-        tray_app["TrayApp<br/>(composition root)"]
-        services["Scheduler, UsageService, Screen,<br/>AgentMonitor, ActivityCounter,<br/>Backlight, Power, SignInCoordinator,<br/>Notifications, Persistence"]
-        tray_app --> services
-    end
-    tray --> tray_app
-    cli --> client
-    cli --> views
-    services --> pbase
-    services --> views
-    services --> client
-    services --> sysmods
-    services --> insights
-```
-
 ## Layers
 
-Dependencies point downwards only: `app` uses everything; `providers`, `render` and `device` don't know about
-`app`; `render` knows nothing of providers or the network; `system` and `device` know nothing of the rest. A test
-(`tests/test_architecture.py`) keeps it that way.
+Dependencies point downwards only. Everything also uses `model.py` (the typed `Usage`) and `errors.py`, so they're
+left out of the drawing, as are arrows that other arrows already imply (`app` also imports `insights` directly).
+A test (`tests/test_architecture.py`) fails if a lower layer reaches up.
 
 ```mermaid
 flowchart TD
-    app["app"] --> providers
+    entry["tray.py<br/>geekmagic_usage.py"]:::entry
+    app["app<br/>the tray app"]:::top
+    cli["cli<br/>one-shot command line"]:::top
+    providers["providers<br/>WHAT is read"]:::mid
+    render["render<br/>how it LOOKS"]:::mid
+    device["device<br/>the SCREEN"]:::mid
+    insights["insights<br/>what the numbers MEAN"]:::low
+    system["system<br/>the OS"]:::low
+
+    entry --> app
+    entry --> cli
+    app --> providers
     app --> render
     app --> device
-    app --> insights
     app --> system
-    cli["cli"] --> providers
+    cli --> providers
     cli --> render
     cli --> device
     providers --> insights
     providers --> system
     render --> insights
-    providers --> model["model, errors"]
-    render --> model
-    insights --> model
-    device --> model
-    system --> paths["paths"]
+
+    classDef entry fill:#eee,stroke:#888
+    classDef top fill:#dbeafe,stroke:#3b82f6
+    classDef mid fill:#dcfce7,stroke:#22c55e
+    classDef low fill:#fef9c3,stroke:#eab308
+```
+
+| Folder | Role | Knows about |
+|---|---|---|
+| `app/` | Keeps the screen up to date: the tray icon, menu and the worker loop | everything below |
+| `cli.py` | Pushes one provider's usage once or on a loop | providers, render, device |
+| `providers/` | One class per AI tool: read its usage, find its CLI, count its logs, sign in | insights, system |
+| `render/` | Readings in, pictures out: mascots, animations, one class per screen | insights |
+| `device/` | The SmallTV's web API and finding it on the network | nothing |
+| `insights/` | Pure logic: pace projection, alert thresholds, activity from local logs | nothing |
+| `system/` | What depends on the OS: notifications, lock detection, start at login, terminals | nothing |
+
+## Inside `app/`
+
+`TrayApp` only builds the parts and wires them together; each part has one job and gets what it needs in its constructor.
+
+```mermaid
+flowchart TD
+    tray["TrayApp<br/>builds and wires, handles clicks"]:::root
+    sched["Scheduler<br/>the worker loop"]
+    usage["UsageService<br/>reads providers, pace, alerts"]
+    screen["Screen<br/>the device and what is stored on it"]
+    agents["AgentMonitor<br/>is an agent working?"]
+    activity["ActivityCounter<br/>stats from local logs"]
+    signin["SignInCoordinator<br/>signed-out providers"]
+    side["Backlight, Power,<br/>Notifications, Persistence"]
+
+    tray --> sched
+    tray --> side
+    sched --> usage
+    sched --> screen
+    sched --> agents
+    sched --> activity
+    sched --> signin
+
+    classDef root fill:#dbeafe,stroke:#3b82f6
+```
+
+## The two families of interchangeable classes
+
+A new AI tool is a new `Provider`; a new screen is a new `View`. The rest of the app doesn't change.
+
+```mermaid
+classDiagram
+    class Provider {
+        <<interface>>
+        fetch() Usage
+        find_cli() path
+        local_stats() dict
+        agent_state() dict
+        login_args
+    }
+    Provider <|-- ClaudeProvider
+    Provider <|-- CodexProvider
+
+    class View {
+        <<interface>>
+        render(data, animation, rotation) Rendered
+    }
+    View <|-- SingleView
+    View <|-- SplitView
+    View <|-- StatsView
+    View <|-- BreakdownView
+    View <|-- HoursView
+    View <|-- ErrorView
 ```
 
 ## One update cycle
 
-What the worker does each time (30 s by default, or when a click or an agent change wakes it):
+What the worker does each time (every 30 s, or when a click or an agent change wakes it):
 
 ```mermaid
 sequenceDiagram
@@ -95,15 +119,12 @@ sequenceDiagram
     S->>U: fetch(provider)
     U->>P: fetch()
     P-->>U: Usage
-    U->>U: history, pace, alerts
-    U-->>S: Usage
+    U-->>S: Usage (with pace, alerts done)
     S->>C: deliver(view, data)
-    C->>V: render(data, animation, rotation)
-    V-->>C: Rendered (GIF + picks)
-    C->>D: upload(GIF, spare slot)
-    D-->>C: stored
-    C->>C: remember picks, swap slot
-    C->>D: show_image(file) if still the active view
+    C->>V: render(data)
+    V-->>C: GIF and rotation picks
+    C->>D: upload(GIF)
+    C->>D: show_image(file)
 ```
 
 ## Patterns, and where to look
