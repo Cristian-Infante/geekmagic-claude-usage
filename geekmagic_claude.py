@@ -70,6 +70,14 @@ class UsageError(RuntimeError):
     pass
 
 
+class SignInNeeded(UsageError):
+    """The provider can't be read because you're signed out (or its session expired): signing in again fixes it."""
+
+
+# What Claude Code says when it isn't signed in ("Not logged in · Please run /login"), however it phrases it.
+_SIGNED_OUT_RE = re.compile(r"not logged in|/login|log ?in again|sign ?in|authenticat|invalid api key|unauthori[sz]ed|token .*expired", re.I)
+
+
 def fetch_usage() -> dict:
     """Call Claude Code's built-in /usage command. Guaranteed $0 cost."""
     try:
@@ -92,6 +100,8 @@ def fetch_usage() -> dict:
         raise UsageError("Timed out waiting for `claude /usage`.") from e
 
     if proc.returncode != 0:
+        if _SIGNED_OUT_RE.search(f"{proc.stdout} {proc.stderr}"):
+            raise SignInNeeded("Claude Code isn't signed in.")
         raise UsageError(f"claude exited {proc.returncode}: {proc.stderr.strip()}")
 
     payload = json.loads(proc.stdout)
@@ -102,6 +112,8 @@ def fetch_usage() -> dict:
 
     result = payload.get("result")
     if payload.get("is_error") or not isinstance(result, str):
+        if _SIGNED_OUT_RE.search(str(result)):
+            raise SignInNeeded("Claude Code isn't signed in.")
         raise UsageError("Claude Code did not return usage text.")
     return pace.annotate(_parse(result))
 
@@ -179,7 +191,7 @@ def _fetch_codex_rate_limits() -> dict:
             if not isinstance(message, dict) or message.get("id") != request_id:
                 continue  # Notifications can arrive between request responses.
             if "error" in message:
-                raise UsageError("Codex could not read account limits. Check your connection and `codex login` with ChatGPT.")
+                raise SignInNeeded("Codex could not read account limits. Not signed in? Run `codex login` with ChatGPT.")
             result = message.get("result")
             if not isinstance(result, dict):
                 raise UsageError("Codex app-server returned an invalid response.")
@@ -199,7 +211,7 @@ def _fetch_codex_rate_limits() -> dict:
         if limits is None:
             limits = result.get("rateLimits")
         if not isinstance(limits, dict) or not any(limits.get(w) for w in ("primary", "secondary")):
-            raise UsageError("Codex returned no account limits. Sign in with ChatGPT using `codex login`.")
+            raise SignInNeeded("Codex returned no account limits. Sign in with ChatGPT using `codex login`.")
         return {**limits, "_reset_credits": result.get("rateLimitResetCredits")}  # the free resets sit beside the limits
     except OSError as e:
         raise UsageError("Lost connection to Codex app-server.") from e
@@ -800,6 +812,40 @@ def _render_frame(usage: dict, mascot_dx: int = 0, mascot_dy: int = 0, extra=Non
     draw.text((((240 - (bbox[2] - bbox[0])) // 2), 223), footer_text, font=footer_font, fill=footer_color)
 
     return image
+
+
+def _render_error_frame(usage: dict) -> Image.Image:
+    """What a provider's screen says when it has never been read: its mascot and why (not signed in, not installed...).
+    Without it a click on a provider that can't be read would change nothing at all and look broken."""
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    theme = _theme(usage)
+    mascot_w = 3 * len(theme["bitmap"][0])
+    _draw_mascot(image, (10, _MASCOT_TOP), 3, theme)
+    draw.text((10 + mascot_w + 10, 8), usage.get("title", "Usage"), font=ImageFont.load_default(size=26), fill=TEXT)
+    heading, body = ImageFont.load_default(size=17), ImageFont.load_default(size=15)
+    draw.text((10, 56), "Sign-in needed" if usage.get("signin") else "Can't read the usage", font=heading, fill=STATE_COLORS["warn"])
+    # the reason, word-wrapped to the screen (what a provider's own error says is meant to be read by a person)
+    lines, line = [], ""
+    for word in str(usage.get("error") or "No reading yet.").split():
+        trial = f"{line} {word}".strip()
+        if draw.textlength(trial, font=body) <= WIDTH - 20:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    lines.append(line)
+    for i, text in enumerate(lines[:7]):
+        draw.text((10, 86 + i * 20), text.strip(), font=body, fill=TEXT if i < 6 else MUTED)
+    footer = "Retrying every few minutes"
+    draw.text(((WIDTH - draw.textlength(footer, font=ImageFont.load_default(size=13))) // 2, 223), footer,
+              font=ImageFont.load_default(size=13), fill=MUTED)
+    return image
+
+
+def push_error(ip: str, usage: dict, filename: str, show: bool = True, cancel: threading.Event | None = None) -> None:
+    """Upload the "can't read it" screen of a provider (usage["title"], usage["error"])."""
+    upload(ip, _encode_gif([_render_error_frame(usage)]), filename, "image/gif", show, cancel)
 
 
 def render(usage: dict) -> bytes:

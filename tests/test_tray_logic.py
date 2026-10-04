@@ -289,7 +289,8 @@ class TrayLogicTests(unittest.TestCase):
                 patch.object(g, "push_split", side_effect=lambda ip, panels, name, **k: uploaded.append(panels)), \
                 patch.object(g, "show_image"):
             self.assertEqual(app._update_split(), "ok")
-            self.assertEqual(len(uploaded[0]), 1)
+            self.assertEqual([x["title"] for x in uploaded[0]], ["Claude", "Codex"], "the one that failed keeps its panel...")
+            self.assertIsNone(uploaded[0][1]["current_pct"], "...with dashes instead of numbers")
             app.last_good.clear()
             with patch.dict(g.PROVIDERS, {"claude": codex_missing}):
                 self.assertEqual(app._update_split(), "error")  # nothing to show at all
@@ -772,7 +773,7 @@ class TrayLogicTests(unittest.TestCase):
                          [f"Brillo {level} %" for level in tray.DEFAULT_BRIGHTNESS_CHOICES])
         self.assertIn("Atenuar al bloquear el PC", sub["Pantalla"])
         self.assertTrue(any(x.startswith("Modo nocturno") for x in sub["Pantalla"]))
-        self.assertEqual(sub["Opciones"], ["Notificaciones", "Avisar cuando un agente termine o te espere", "Pausar al bloquear el PC"])
+        self.assertEqual(sub["Opciones"], ["Iniciar sesión", "Notificaciones", "Avisar cuando un agente termine o te espere", "Pausar al bloquear el PC"])
         self.assertEqual(sub["Más vistas"], ["Proyectos y modelos", "Horas pico"])
 
     def test_night_hours_argument(self):

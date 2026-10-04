@@ -97,7 +97,7 @@ The menu, top to bottom (its labels are in Spanish; the English is in brackets):
 - **Más vistas** (More views) ▸ **Proyectos y modelos** (Projects and models) and **Horas pico** (Peak hours).
 - **Actualizar ahora** (Update now) and **Pausar** (Pause).
 - **Pantalla** (Screen) ▸ brightness levels, **Modo nocturno** (Night mode), **Atenuar al bloquear el PC** (Dim when the PC locks).
-- **Opciones** (Options) ▸ **Notificaciones** (Notifications), **Avisar cuando un agente termine** (Notify when an agent finishes), **Pausar al bloquear el PC** (Pause when the PC locks).
+- **Opciones** (Options) ▸ **Iniciar sesión** (Sign in), **Notificaciones** (Notifications), **Avisar cuando un agente termine** (Notify when an agent finishes), **Pausar al bloquear el PC** (Pause when the PC locks).
 - **Ver logs** (View logs) and **Salir** (Quit).
 
 - **Near-instant switching.** Each provider's last image already lives on the
@@ -115,6 +115,25 @@ The menu, top to bottom (its labels are in Spanish; the English is in brackets):
   of leaving old labels or colours there until you open each view.
 - **View logs** opens `tray.log` (next to the script, rotated at 512 KB).
   What the app remembers between runs lives in `tray_state.json`.
+
+### Signing in
+
+If a provider can't be read because you're **signed out** (or its session
+expired), picking it **opens its sign-in** in a terminal window: `claude auth
+login` or `codex login`. Approve it in the browser that opens and the screen fills
+in by itself, within seconds (it looks again every 10 s while a sign-in is pending).
+
+- **When it opens:** when you pick a signed-out provider (the menu or the
+  click). Not again for 5 minutes, so cycling past it with the click doesn't pile
+  up windows. **Opciones ▸ Iniciar sesión** opens it on demand for either provider.
+- **What the screen says meanwhile:** the provider's screen shows **"Sign-in
+  needed"** and what to do, instead of nothing. If its CLI isn't installed it says
+  how to install it. In the split and stats views the panel keeps its place with
+  dashes until it can be read.
+- **How it knows it's signed out:** a read fails for that reason (each CLI says so
+  in its own way). A timeout or a network error never opens a window.
+- A provider that *was* working and then fails keeps its last numbers, dimmed
+  (see [Stale data](#stale-data)).
 
 ### Split view
 
@@ -472,6 +491,8 @@ python -m unittest tests.test_alerts    # one file
 | `test_alerts.py` | colour thresholds and when notifications fire |
 | `test_pace.py` | pace projection: where a window ends up, when it runs out |
 | `test_agent_activity.py` | deciding from the logs whether Claude / Codex is working, waiting for you or idle, per session |
+| `test_login.py` | opening a provider's sign-in per OS (quoting, terminals), and telling "signed out" from other failures |
+| `test_tray_signin.py` | picking a signed-out provider opens its sign-in once, and its screen says so |
 | `test_notifier.py` | the system-route backup per OS, and that nothing in the text can break (or inject into) the command |
 | `test_single_instance.py` | a second copy can't start while the first runs, and the lock frees up afterwards |
 | `test_response_times.py` | small-but-identical GIFs, one request to show an image, parallel reads, start-up order |

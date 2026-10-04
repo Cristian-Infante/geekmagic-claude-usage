@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -36,6 +37,7 @@ import alerts
 import autostart
 import discover
 import geekmagic_claude as g
+import login
 import notifier
 import pace
 import session_lock
@@ -72,6 +74,8 @@ REDISCOVER_EVERY = 120  # ...and then at most this often
 DISCOVER_RETRY = 30  # while there's no address at all, how often to scan
 LOCK_POLL = 3  # seconds between checks of whether the computer got locked / unlocked
 PAUSE_POLL = 5  # while paused, how often the worker looks again
+LOGIN_COOLDOWN = 300  # a sign-in window isn't opened again for the same provider within this many seconds
+LOGIN_POLL = 10  # while one is being signed in, how often its usage is tried again (so the screen fills in at once)
 LOCAL_STATS_EVERY = 600  # the providers' local activity counts are refreshed at most this often (seconds)
 LOCAL_STATS_RETRY = 60  # ...or this often while one of them is still missing (it failed)
 BACKGROUND_STATS = True  # count in a thread (the first count of a month of logs takes seconds); tests turn it off
@@ -215,6 +219,12 @@ class App:
         self.last_fetch: dict[str, float] = {}
         self.last_good: dict[str, tuple[dict, float]] = {}  # provider -> (last usage that was read OK, when)
         self.stale: set[str] = set()  # providers whose image on the device is the dimmed "no fresh data" one
+        self.needs_login: set[str] = set()  # providers whose last read failed because you're signed out
+        self.login_at: dict[str, float] = {}  # provider -> when its sign-in window was last opened (monotonic)
+        self.login_notes: dict[str, str] = {}  # provider -> what its screen says about that window
+        self.login_missing: set[str] = set()  # providers whose CLI isn't installed, so there's nothing to sign in to
+        self.errors: dict[str, str] = {}  # provider -> why its last read failed (gone once a read works)
+        self.error_shown: dict[str, str] = {}  # provider -> the error its image on the device says
         self.last_click = 0.0
         self.last_scan = 0.0
         self.offline = False  # the device didn't answer on the last attempt
@@ -248,6 +258,8 @@ class App:
                     pystray.MenuItem("Atenuar al bloquear el PC", self.toggle_dim_on_lock, checked=lambda _: self.dim_on_lock),
                 )),
                 pystray.MenuItem("Opciones", pystray.Menu(
+                    pystray.MenuItem("Iniciar sesión", pystray.Menu(
+                        *(pystray.MenuItem(TITLES[key], self._login_action(key)) for key in TITLES))),
                     pystray.MenuItem("Notificaciones", self.toggle_notifications, checked=lambda _: self.notify_enabled),
                     pystray.MenuItem("Avisar cuando un agente termine o te espere", self.toggle_notify_done, checked=lambda _: self.notify_done),
                     pystray.MenuItem("Pausar al bloquear el PC", self.toggle_pause_on_lock, checked=lambda _: self.pause_on_lock),
@@ -394,6 +406,7 @@ class App:
         self.mode = None
         self.icon.icon = make_icon(provider)
         self._switched(provider)
+        self._run_in_background(self.ask_login, provider)  # (only does anything if it's signed out)
 
     def toggle(self) -> None:
         """Left-click: Claude <-> Codex. From the split or stats view it goes back to the provider you were on."""
@@ -699,6 +712,8 @@ class App:
                 if key in PANEL_PUSH:
                     extra = {"animation": self.animation} if key == SPLIT else {}  # the stats view is a still
                     getattr(g, PANEL_PUSH[key])(self.ip, usage["panels"], filename, show=False, cancel=cancel, **extra)
+                elif usage.get("error"):  # a provider that has never been read: say why instead of showing nothing
+                    g.push_error(self.ip, usage, filename, show=False, cancel=cancel)
                 else:
                     g.push_usage(self.ip, usage, self.animation, filename, show=False, cancel=cancel)
             except g.UploadCancelled:
@@ -707,6 +722,8 @@ class App:
                 return False
             self.slot[key] = spare
             self.outdated.discard(key)
+            if key in TITLES and usage.get("error"):
+                self.error_shown[key] = usage["error"]
             self._save_state()
             self.last_upload[key] = time.monotonic()
             if key == self._active_key():  # checked after the slow upload, in case the user switched meanwhile
@@ -824,7 +841,13 @@ class App:
         try:
             usage = g.PROVIDERS[provider]()
         except Exception as e:  # keep the tray alive no matter what
-            log.exception("fetch failed (%s)", provider)
+            if isinstance(e, g.UsageError):  # an expected problem (not signed in...): its message says it all
+                log.warning("fetch failed (%s): %s", provider, e)
+            else:
+                log.exception("fetch failed (%s)", provider)
+            if isinstance(e, g.SignInNeeded):
+                self.needs_login.add(provider)
+            self.errors[provider] = self._login_note(provider) or str(e)  # (while a sign-in window is open it says so)
             if provider == self.provider:
                 self.icon.title = f"GeekMagic: {e}"[:120]
             self._mark_stale(provider)
@@ -834,6 +857,10 @@ class App:
             pace.annotate(usage, self._recent_rates(provider, usage))  # the pace that goes under each bar
             self.last_good[provider] = (usage, time.monotonic())
             self.stale.discard(provider)
+            self.errors.pop(provider, None)
+            self.error_shown.pop(provider, None)
+            self.needs_login.discard(provider)
+            self.login_notes.pop(provider, None)
             self._check_alerts(provider, usage)
         return usage
 
@@ -909,6 +936,58 @@ class App:
         except Exception:  # it must never break the update loop
             log.warning("could not show the notification", exc_info=True)
 
+    # --- signing in -----------------------------------------------------------------------------------------------
+
+    def _signed_out(self, provider: str) -> bool:
+        """Did its last read fail because you're signed out? (Only a read can tell: each CLI says so in its own way.)"""
+        return provider in self.needs_login
+
+    def _login_pending(self, provider: str) -> bool:
+        """Its sign-in window was opened a moment ago and the usage can't be read yet."""
+        return provider in self.login_notes and time.monotonic() - self.login_at.get(provider, 0) < LOGIN_COOLDOWN
+
+    def _login_note(self, provider: str) -> str | None:
+        return self.login_notes.get(provider) if self._login_pending(provider) else None
+
+    def ask_login(self, provider: str, force: bool = False) -> None:
+        """Open the provider's sign-in in a terminal window when it's signed out (the menu's Options > Sign in does it
+        even if we can't tell). Not again for a few minutes after, so cycling past it with the click doesn't pile up
+        windows. The provider's screen says what to do, and fills in by itself once you've signed in."""
+        if not force and (not self._signed_out(provider) or self._login_pending(provider)):
+            return
+        outcome = login.launch(provider)
+        title = TITLES[provider]
+        self.login_at[provider] = time.monotonic()
+        if outcome == "started":
+            self.login_missing.discard(provider)
+            note = f"A window opened: finish signing in to {title} there. This screen fills in by itself."
+            self._notify(title, "Inicia sesión en la ventana que se abrió")
+        elif outcome == "missing":
+            self.login_missing.add(provider)
+            note = f"{title}'s CLI isn't installed. {login.INSTALL_HINTS[provider]}"
+            self._notify(title, "No se encontró su CLI: instálalo para poder iniciar sesión")
+        else:
+            note = f"Couldn't open a terminal. Sign in to {title} by running its CLI yourself."
+        log.info("sign-in for %s: %s", provider, outcome)
+        self.login_notes[provider] = note
+        self.errors[provider] = note
+        self.error_shown.pop(provider, None)
+        self.wake.set()
+
+    def _login_action(self, provider: str):
+        return lambda: self._run_in_background(self.ask_login, provider, True)
+
+    def _error_usage(self, provider: str) -> dict | None:
+        """What to put on a provider's screen when it has never been read: the reason it failed. None when there's
+        nothing to say, or the screen already says it (it would only be uploaded again every cycle for nothing)."""
+        message = self.errors.get(provider)
+        if not message or provider in self.last_good:
+            return None  # (one that has been read before is dimmed as stale instead, see _mark_stale)
+        if self.error_shown.get(provider) == message and provider in self.slot and provider not in self.outdated:
+            return None
+        return {"title": TITLES[provider], "error": message, "now": datetime.now().astimezone(),
+                "signin": self._signed_out(provider) and provider not in self.login_missing}
+
     def _refresh_other(self, provider: str) -> None:
         """The provider that isn't on screen: read it now and then (its alerts matter too) and keep its image fresh."""
         other = "codex" if provider == "claude" else "claude"
@@ -916,7 +995,7 @@ class App:
         needs_image = (other not in self.slot or other in self.outdated) and not self.offline
         if not needs_image and time.monotonic() - self.last_fetch.get(other, 0) < OTHER_REFRESH:
             return
-        usage = self._fetch_usage(other)
+        usage = self._fetch_usage(other) or self._error_usage(other)
         if usage is not None and self.ip and not self.offline:
             try:
                 self._upload(other, usage)
@@ -930,6 +1009,13 @@ class App:
         for provider in TITLES:
             good = self.last_good.get(provider)
             if good is None:
+                if provider in self.errors and any(p in self.last_good for p in TITLES):
+                    # it can't be read: its panel says so with dashes rather than vanishing
+                    usage = {"title": TITLES[provider], "current_pct": None, "current_reset": None, "weekly_pct": None,
+                             "weekly_reset": None, "now": datetime.now().astimezone()}
+                    if key in STATS_VIEWS:
+                        usage["activity"] = self.local_stats.get(provider)
+                    panels.append(usage)
                 continue
             usage, read_at = good
             usage = dict(usage, stale=True) if time.monotonic() - read_at >= STALE_SECONDS else dict(usage)
@@ -1001,7 +1087,7 @@ class App:
                 if key in STATS_VIEWS:
                     self._refresh_local_stats()
                 usage = {"panels": self._panels(key)}
-                ready = bool(usage["panels"])
+                ready = len(usage["panels"]) == len(TITLES)  # (half a view would be stored as if it were whole)
             else:
                 good = self.last_good.get(key)
                 usage, ready = (good[0] if good else None), good is not None
@@ -1034,6 +1120,8 @@ class App:
                 continue
             provider = self.provider
             wait = self.interval
+            if any(self._login_pending(p) for p in (TITLES if self.mode else [provider])):
+                wait = LOGIN_POLL  # someone is signing in right now: notice it as soon as it works
             # An agent started or stopped (and nothing else changed): redraw from the readings we already have.
             redraw_only, self.agent_dirty = self.agent_dirty, False
             if self.mode:
@@ -1049,7 +1137,7 @@ class App:
             elif redraw_only and self._recently_read(provider):
                 usage = self.last_good[provider][0]
             else:
-                usage = self._fetch_usage(provider)
+                usage = self._fetch_usage(provider) or self._error_usage(provider)
             pending = None
             if usage is not None:
                 outcome = self._deliver(provider, usage)

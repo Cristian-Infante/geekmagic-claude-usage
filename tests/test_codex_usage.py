@@ -83,9 +83,9 @@ assert sys.stdin.read() == ""  # No threads, prompts, or model turns were sent.
                 g.fetch_codex_usage()
 
     def test_auth_failure_and_no_limits(self):
-        with self.assertRaisesRegex(g.UsageError, "codex login"):
+        with self.assertRaisesRegex(g.SignInNeeded, "codex login"):  # being signed out is what signing in again fixes
             self.query(mode="error")
-        with self.assertRaisesRegex(g.UsageError, "no account limits"):
+        with self.assertRaisesRegex(g.SignInNeeded, "no account limits"):
             self.query({"rateLimits": None})
 
     def test_child_exit_and_timeout(self):
